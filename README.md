@@ -1,10 +1,11 @@
 # APL Develop Tools
 
-AOI（自動光學檢測）開發用的工具集合。目前包含一支 CLI：
+AOI（自動光學檢測）開發用的工具集合。目前包含兩支 CLI：
 
 | 工具 | 說明 |
 | --- | --- |
 | [`scripts/crop_images.py`](scripts/crop_images.py) | 依 AOI 機台輸出的 XML 所標記的區域，批次裁切原始影像 |
+| [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
 
 ## 環境需求
 
@@ -106,6 +107,98 @@ INFO Done. Summary:
 
 離開碼（exit code）：成功為 `0`（找不到任何 XML 檔也是 `0`），
 `--xml-dir` 或 `--image-dir` 不存在時為 `2`。
+
+## group_images.py
+
+遞迴掃描 image 目錄（通常就是 `crop_images.py` 的輸出）下的所有影像，依檔名判斷
+光源、篩選出指定光源的影像，再依 Component Name 分類複製到子資料夾。
+
+檔名規則為：
+
+```
+{Component Name}_{Pad ID}_{光源}.jpg
+```
+
+光源為 `SolderLight` 或 `UniformLight`。輸出結構：
+
+```
+<output-dir>/{Component Name}/{檔名}            # 指定單一光源
+<output-dir>/{光源}/{Component Name}/{檔名}      # --light all
+```
+
+來源影像一律是**複製**，不會搬移或刪除。
+
+### 基本用法
+
+```bash
+uv run scripts/group_images.py \
+    --image-dir  ./OUT \
+    --output-dir ./GROUPED \
+    --light SolderLight
+```
+
+先用 `--dry-run` 確認分類結果，不會實際寫檔：
+
+```bash
+uv run scripts/group_images.py -i ./OUT -o ./GROUPED -l SolderLight --dry-run
+```
+
+兩種光源一次分好（會多一層光源資料夾）：
+
+```bash
+uv run scripts/group_images.py -i ./OUT -o ./GROUPED -l all
+```
+
+### 參數
+
+| 參數 | 預設 | 說明 |
+| --- | --- | --- |
+| `-i`, `--image-dir` | （必填） | 遞迴搜尋影像的目錄 |
+| `-o`, `--output-dir` | （必填） | 輸出根目錄，每個 component 一個子資料夾 |
+| `-l`, `--light` | （必填） | `SolderLight` / `UniformLight` / `all`，忽略大小寫 |
+| `--ext` | `.jpg .jpeg .png .bmp .tif .tiff` | 要掃描的副檔名 |
+| `--on-exists` | `suffix` | 輸出檔已存在時的處理方式：`suffix` / `skip` / `overwrite` |
+| `--dry-run` | 關閉 | 只回報會複製什麼，不寫檔 |
+| `-v`, `--verbose` | 關閉 | DEBUG 等級日誌 |
+| `-q`, `--quiet` | 關閉 | 只輸出 warning 與 error |
+
+### 檔名解析的容錯
+
+- 光源比對忽略**大小寫**，且是**由右往左**找，因此 `crop_images.py` 加上的
+  `_1`、`_2` 編號後綴（`C1_1_SolderLight_1.jpg`）仍能正確解析。
+- Component Name 允許含底線：`U5_A_3_UniformLight.jpg` 會解析成
+  component `U5_A`、pad `3`。
+- 檔名不符規則（找不到光源、或前面不足以構成 `{Component}_{Pad}`）只會記錄
+  warning 並計入 `unparsed`，不會中斷整批執行。
+- 若 `--output-dir` 位於 `--image-dir` 之內，掃描時會自動排除輸出目錄，重跑不會
+  把自己複製出來的檔案再分類一次。
+
+### 檔名衝突處理
+
+不同 board／日期底下可能有**同名**的裁切圖（例如兩塊板子都有
+`C1_1_SolderLight.jpg`），而分類後它們會落在同一個 component 資料夾。
+
+規則與 `crop_images.py` 一致：同一次執行中，兩個不同的來源檔永遠不會互相覆蓋，
+後來者一律加上 `_1`、`_2`… 編號後綴；`--on-exists` 只作用在**先前執行**就已存在
+於磁碟上的檔案（`suffix` / `skip` / `overwrite`）。
+
+> **注意**：預設的 `suffix` 在重跑時會把整批影像再複製一份（因為同名檔已存在，
+> 就會全部加後綴）。要重跑請用乾淨的 `--output-dir`，或加上 `--on-exists skip`。
+
+### 統計
+
+```
+INFO Done. Summary:
+  images_seen       : 10    # 掃到的影像檔數
+  copied            : 6     # 已複製（dry-run 時為「將會複製」）
+  skipped_existing  : 0     # 因輸出已存在而跳過
+  other_light       : 3     # 光源不是指定的那一種
+  unparsed          : 1     # 檔名不符命名規則
+  copy_errors       : 0     # 複製失敗
+```
+
+離開碼（exit code）：成功為 `0`（找不到任何影像也是 `0`），
+`--image-dir` 不存在時為 `2`。
 
 ## 開發
 
