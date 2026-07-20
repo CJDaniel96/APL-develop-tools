@@ -1,11 +1,12 @@
 # APL Develop Tools
 
-AOI（自動光學檢測）開發用的工具集合。目前包含兩支 CLI：
+AOI（自動光學檢測）開發用的工具集合。目前包含三支 CLI：
 
 | 工具 | 說明 |
 | --- | --- |
 | [`scripts/crop_images.py`](scripts/crop_images.py) | 依 AOI 機台輸出的 XML 所標記的區域，批次裁切原始影像 |
 | [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
+| [`scripts/rotate_images.py`](scripts/rotate_images.py) | 依 pixel size 判斷方向，將影像統一旋轉為橫向或豎向 |
 
 ## 環境需求
 
@@ -199,6 +200,57 @@ INFO Done. Summary:
 
 離開碼（exit code）：成功為 `0`（找不到任何影像也是 `0`），
 `--image-dir` 不存在時為 `2`。
+
+## rotate_images.py
+
+依影像實際 pixel size 判斷方向：`width > height` 是橫向（landscape），
+`height > width` 是豎向（portrait）。選擇目標方向後，不符合的影像會旋轉 90°，
+已符合方向及正方形影像則原樣複製到輸出路徑。判斷不採用 EXIF 顯示方向。
+
+輸入可以是單一影像，也可以是資料夾；資料夾會遞迴搜尋並在輸出目錄保留相對路徑。
+
+### 將資料夾內影像統一為橫向
+
+```bash
+uv run scripts/rotate_images.py \
+    --input ./IMAGES \
+    --output-dir ./LANDSCAPE \
+    --target landscape
+```
+
+### 將單一影像統一為豎向
+
+```bash
+uv run scripts/rotate_images.py \
+    --input ./photo.jpg \
+    --output-dir ./PORTRAIT \
+    --target portrait
+```
+
+先用 `--dry-run` 查看每張影像的 pixel size 與預計動作：
+
+```bash
+uv run scripts/rotate_images.py \
+    -i ./IMAGES -o ./ROTATED -t landscape --dry-run
+```
+
+### 參數
+
+| 參數 | 預設 | 說明 |
+| --- | --- | --- |
+| `-i`, `--input` | （必填） | 單一影像，或要遞迴搜尋的資料夾 |
+| `-o`, `--output-dir` | （必填） | 輸出目錄；資料夾輸入會保留相對目錄結構 |
+| `-t`, `--target` | （必填） | `landscape`（橫向）或 `portrait`（豎向） |
+| `--rotation` | `clockwise` | 需要旋轉時採順時針或逆時針：`clockwise` / `counterclockwise` |
+| `--ext` | `.jpg .jpeg .png .bmp .tif .tiff .webp` | 資料夾模式要掃描的副檔名 |
+| `--on-exists` | `suffix` | 輸出檔已存在時：`suffix` / `skip` / `overwrite` |
+| `--dry-run` | 關閉 | 只檢查與回報，不寫入檔案 |
+| `-v`, `--verbose` | 關閉 | DEBUG 等級日誌 |
+| `-q`, `--quiet` | 關閉 | 只輸出 warning 與 error |
+
+正方形影像（`width == height`）旋轉 90° 後方向不變，因此會原樣複製，並在統計的
+`square` 欄位中顯示。無法讀取或寫入任一影像時，程式會繼續處理其餘檔案，最後以
+離開碼 `1` 結束；輸入路徑無效時為 `2`，全部成功時為 `0`。
 
 ## 開發
 
