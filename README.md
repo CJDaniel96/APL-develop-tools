@@ -1,10 +1,11 @@
 # APL Develop Tools
 
-AOI（自動光學檢測）開發用的工具集合。目前包含三支 CLI：
+AOI（自動光學檢測）開發用的工具集合。目前包含四支 CLI：
 
 | 工具 | 說明 |
 | --- | --- |
 | [`scripts/crop_images.py`](scripts/crop_images.py) | 依 AOI 機台輸出的 XML 所標記的區域，批次裁切原始影像 |
+| [`scripts/crop_components.py`](scripts/crop_components.py) | 依元件清單篩選影像，從同名 XML 讀取 bbox 並裁切元件 |
 | [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
 | [`scripts/rotate_images.py`](scripts/rotate_images.py) | 依 pixel size 判斷方向，將影像統一旋轉為橫向或豎向 |
 
@@ -108,6 +109,69 @@ INFO Done. Summary:
 
 離開碼（exit code）：成功為 `0`（找不到任何 XML 檔也是 `0`），
 `--xml-dir` 或 `--image-dir` 不存在時為 `2`。
+
+## crop_components.py
+
+輸入根目錄預期含有 `XML` 資料夾，以及根目錄或 `NG` 等子目錄內的影像。元件清單
+是 UTF-8 txt 檔，每行一個 Component Name（空白行會忽略）。影像檔名規則：
+
+```
+{數字代號}_{時間戳}_{日期}_{機台編號}_{component}_{小板號}_{component}_{小板號}_{光源}.jpg
+```
+
+程式會用清單中的名稱解析檔名，因此 Component Name 本身可以含底線。符合清單的影像
+會依檔名 stem 尋找 `XML` 目錄下的同名 `.xml`，再從以下階層尋找資料：
+
+```
+Panel > Board > Component[CompName="{component}_{小板號}"]
+  > CompImage > Image[X1, Y1, X2, Y2]
+```
+
+座標會正規化並限制在影像邊界內。輸出會保留相對於輸入根目錄的路徑，例如
+`<input>/NG/a.jpg` 會寫成 `<output>/NG/a.jpg`。
+
+### 基本用法
+
+```bash
+uv run scripts/crop_components.py \
+    --input-dir ./DATA \
+    --component-list ./components.txt \
+    --output-dir ./CROPPED
+```
+
+預設 XML 目錄是 `<input-dir>/XML`；也可以另外指定：
+
+```bash
+uv run scripts/crop_components.py -i ./DATA -c ./components.txt \
+    -o ./CROPPED --xml-dir ./OTHER_XML
+```
+
+建議先驗證檔名、XML 對應及 bbox，不實際寫檔：
+
+```bash
+uv run scripts/crop_components.py -i ./DATA -c ./components.txt \
+    -o ./CROPPED --dry-run
+```
+
+### 參數
+
+| 參數 | 預設 | 說明 |
+| --- | --- | --- |
+| `-i`, `--input-dir` | （必填） | 影像與 `XML` 所在的輸入根目錄 |
+| `-c`, `--component-list` | （必填） | UTF-8 txt，每行一個 Component Name |
+| `-o`, `--output-dir` | （必填） | 裁切結果目錄，保留來源相對路徑 |
+| `-x`, `--xml-dir` | `<input-dir>/XML` | XML 搜尋目錄 |
+| `--ext` | 常見影像格式 | 要掃描的影像副檔名 |
+| `--ignore-case` | 關閉 | Component Name 與 XML `CompName` 忽略大小寫 |
+| `--on-exists` | `suffix` | 已存在時：`suffix` / `skip` / `overwrite` |
+| `--dry-run` | 關閉 | 只驗證與回報，不寫檔 |
+| `-v`, `--verbose` | 關閉 | DEBUG 等級日誌 |
+| `-q`, `--quiet` | 關閉 | 只輸出 warning 與 error |
+
+如果同一個 Component 下有多個 `Image`，程式會優先比對 `PicPath`、`FileName`
+等欄位中的影像檔名，其次比對光源欄位；仍無法唯一判定時會跳過，避免使用錯誤 bbox。
+任一已選影像因缺 XML、缺 Component、bbox 無效或讀寫失敗時，整批仍會繼續，最後
+回傳離開碼 `1`；輸入路徑／清單無效時為 `2`，全部成功時為 `0`。
 
 ## group_images.py
 
