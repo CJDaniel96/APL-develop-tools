@@ -320,8 +320,9 @@ uv run scripts/rotate_images.py \
 
 ## yolo_classify.py
 
-使用 Ultralytics YOLO 模型遞迴推論影像，將畫有 bbox、label 與 confidence 的結果
-存到 `OK` 或 `NG` 資料夾。
+使用 Ultralytics YOLO 模型遞迴推論影像，依判定結果存到 `OK` 或 `NG` 資料夾。
+每個最終分類會同時保存畫有 bbox、label 與 confidence 的推論效果圖，以及可匯入
+CVAT review 的原始影像與 Pascal VOC XML。
 
 ### 判定規則
 
@@ -339,13 +340,26 @@ uv run scripts/rotate_images.py \
 ```text
 <output-dir>/
 ├── OK/
-│   └── image.jpg
+│   ├── inference/
+│   │   └── image.jpg     # 畫有 YOLO 偵測結果
+│   └── original/
+│       ├── image.jpg     # 未修改的原始影像
+│       └── image.xml     # Pascal VOC annotation
 └── NG/
     ├── scratch/          # NG label 名稱
-    │   └── image.jpg
+    │   ├── inference/
+    │   │   └── image.jpg
+    │   └── original/
+    │       ├── image.jpg
+    │       └── image.xml
     ├── _ok_rule/         # OK 數量或中心位置不符，且沒有有效 NG label
     └── _no_detection/    # 完全沒有 detection
 ```
+
+XML 會包含該張影像的所有模型 detection（不只影響 OK/NG 判定的框），方便在
+CVAT 逐框 review、修正或補標。完全沒有 detection 時仍會產生不含 `<object>` 的
+有效 Pascal VOC XML。當檔名衝突且使用預設 `--on-exists suffix` 時，效果圖、原圖
+與 XML 會套用相同流水號，維持配對關係。
 
 ### 基本用法
 
@@ -382,7 +396,7 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 | --- | --- | --- |
 | `-m`, `--model` | （必填） | `.pt` 模型路徑或 Ultralytics 模型名稱 |
 | `-s`, `--source` | （必填） | 單一影像或要遞迴搜尋的目錄 |
-| `-o`, `--output-dir` | （必填） | 輸出根目錄 |
+| `-o`, `--output-dir` | （必填） | 輸出根目錄；分類下建立 `inference/`、`original/` |
 | `--ok-label` | （必填） | 模型中代表 OK 的完整 label name，區分大小寫 |
 | `--ok-count` | （必填） | 必須偵測到的精確 OK 數量，至少為 1 |
 | `--center-tolerance` | `0.25` | bbox 中心相對影像中心的水平、垂直容許比例 |

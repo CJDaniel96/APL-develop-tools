@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Ultralytics YOLO inference and sort annotated images into OK/NG.
+"""Run Ultralytics YOLO inference and sort review artifacts into OK/NG.
 
 An image is OK only when:
 
@@ -11,14 +11,22 @@ Non-OK detections outside every OK bounding box are ignored.  If an image has
 no OK detection, any non-OK detection makes it NG.  NG images are saved below
 the class-name folder of the qualifying NG detection with the smallest class
 id.  Rule failures without such a detection use a diagnostic folder.
+
+Each final category contains an ``inference`` directory for rendered
+detections and an ``original`` directory for source images plus Pascal VOC
+XML annotations.  The XML contains every detection returned by the model so
+that the image/annotation pairs can be imported into CVAT for review.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import re
+import shutil
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -38,6 +46,8 @@ _DEFAULT_EXTENSIONS = (
 )
 _DIAGNOSTIC_OK_RULE = "_ok_rule"
 _DIAGNOSTIC_NO_DETECTION = "_no_detection"
+_INFERENCE_DIR = "inference"
+_ORIGINAL_DIR = "original"
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,19 @@ class Decision:
     reason: str
     folder: str
     qualifying_ng: tuple[Detection, ...] = ()
+
+
+@dataclass(frozen=True)
+class OutputTargets:
+    """Paths for one image's related review artifacts."""
+
+    inference: Path
+    original: Path
+    annotation: Path
+
+    def all(self) -> tuple[Path, Path, Path]:
+        """Return all paths for collision checks and reservations."""
+        return self.inference, self.original, self.annotation
 
 
 @dataclass
@@ -282,24 +305,43 @@ def find_images(
     return images
 
 
-def unique_output(
-    target: Path,
+def output_targets(category_dir: Path, filename: str) -> OutputTargets:
+    """Build the related output paths for one final category."""
+    return OutputTargets(
+        inference=category_dir / _INFERENCE_DIR / filename,
+        original=category_dir / _ORIGINAL_DIR / filename,
+        annotation=category_dir / _ORIGINAL_DIR / Path(filename).with_suffix(
+            ".xml"
+        ).name,
+    )
+
+
+def unique_output_targets(
+    category_dir: Path,
+    filename: str,
     used: set[Path],
     on_exists: str,
-) -> Path | None:
-    """Choose a non-colliding output path according to the CLI policy."""
-    if target not in used:
-        if not target.exists() or on_exists == "overwrite":
-            return target
+) -> OutputTargets | None:
+    """Choose synchronized, non-colliding artifact paths."""
+    targets = output_targets(category_dir, filename)
+    paths = targets.all()
+    if not any(path in used for path in paths):
+        if not any(path.exists() for path in paths) or on_exists == "overwrite":
+            return targets
         if on_exists == "skip":
             return None
 
     index = 1
     while True:
-        candidate = target.with_name(
-            f"{target.stem}_{index}{target.suffix}"
+        source_name = Path(filename)
+        candidate_name = (
+            f"{source_name.stem}_{index}{source_name.suffix}"
         )
-        if candidate not in used and not candidate.exists():
+        candidate = output_targets(category_dir, candidate_name)
+        candidate_paths = candidate.all()
+        if not any(path in used for path in candidate_paths) and not any(
+            path.exists() for path in candidate_paths
+        ):
             return candidate
         index += 1
 
@@ -311,6 +353,92 @@ def save_annotated_result(result: Any, target: Path) -> None:
     image = Image.fromarray(plotted_rgb)
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target)
+
+
+def _voc_coordinate_pair(
+    lower: float,
+    upper: float,
+    limit: int,
+) -> tuple[int, int]:
+    """Convert one floating-point bbox axis to clamped VOC coordinates."""
+    low = max(0, min(limit, math.floor(min(lower, upper))))
+    high = max(0, min(limit, math.ceil(max(lower, upper))))
+    return low, high
+
+
+def write_pascal_voc(
+    target: Path,
+    image_path: Path,
+    image_size: tuple[int, int],
+    depth: int,
+    detections: Sequence[Detection],
+) -> None:
+    """Write all model detections as one Pascal VOC XML annotation."""
+    width, height = image_size
+    annotation = ET.Element("annotation")
+    ET.SubElement(annotation, "folder").text = image_path.parent.name
+    ET.SubElement(annotation, "filename").text = image_path.name
+
+    source = ET.SubElement(annotation, "source")
+    ET.SubElement(source, "database").text = "YOLO inference"
+
+    size = ET.SubElement(annotation, "size")
+    ET.SubElement(size, "width").text = str(width)
+    ET.SubElement(size, "height").text = str(height)
+    ET.SubElement(size, "depth").text = str(depth)
+    ET.SubElement(annotation, "segmented").text = "0"
+
+    for detection in detections:
+        x1, y1, x2, y2 = detection.bbox
+        xmin, xmax = _voc_coordinate_pair(x1, x2, width)
+        ymin, ymax = _voc_coordinate_pair(y1, y2, height)
+        is_truncated = (
+            min(x1, x2) < 0
+            or min(y1, y2) < 0
+            or max(x1, x2) > width
+            or max(y1, y2) > height
+        )
+
+        item = ET.SubElement(annotation, "object")
+        ET.SubElement(item, "name").text = detection.label
+        ET.SubElement(item, "pose").text = "Unspecified"
+        ET.SubElement(item, "truncated").text = "1" if is_truncated else "0"
+        ET.SubElement(item, "difficult").text = "0"
+        box = ET.SubElement(item, "bndbox")
+        ET.SubElement(box, "xmin").text = str(xmin)
+        ET.SubElement(box, "ymin").text = str(ymin)
+        ET.SubElement(box, "xmax").text = str(xmax)
+        ET.SubElement(box, "ymax").text = str(ymax)
+
+    ET.indent(annotation, space="  ")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(annotation).write(
+        target,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
+
+
+def save_review_artifacts(
+    result: Any,
+    source: Path,
+    targets: OutputTargets,
+    detections: Sequence[Detection],
+    image_size: tuple[int, int],
+) -> None:
+    """Save inference preview, untouched source image, and VOC XML."""
+    save_annotated_result(result, targets.inference)
+    targets.original.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, targets.original)
+    with Image.open(source) as image:
+        depth = len(image.getbands())
+    write_pascal_voc(
+        target=targets.annotation,
+        image_path=targets.original,
+        image_size=image_size,
+        depth=depth,
+        detections=detections,
+    )
 
 
 def _positive_int(value: str) -> int:
@@ -331,7 +459,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Run Ultralytics YOLO inference and sort annotated images into "
+            "Run Ultralytics YOLO inference and sort review artifacts into "
             "OK and NG folders."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -354,7 +482,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         required=True,
         type=Path,
-        help="Root directory for OK/ and NG/<label>/ results.",
+        help=(
+            "Root for OK/ and NG/<label>/ review artifacts. Each category "
+            "gets inference/ and original/ subdirectories."
+        ),
     )
     parser.add_argument(
         "--ok-label",
@@ -417,12 +548,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--on-exists",
         choices=("suffix", "skip", "overwrite"),
         default="suffix",
-        help="What to do when an output image already exists.",
+        help="What to do when any related output artifact already exists.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run inference and classification without saving images.",
+        help="Run inference and classification without saving artifacts.",
     )
     parser.add_argument(
         "-v",
@@ -440,7 +571,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run inference, classification, and annotated-image saving."""
+    """Run inference, classification, and review-artifact saving."""
     args = parse_args(argv)
     level = logging.DEBUG if args.verbose else logging.INFO
     if args.quiet:
@@ -528,27 +659,42 @@ def main(argv: list[str] | None = None) -> int:
 
         if decision.is_ok:
             stats.ok += 1
-            target = args.output_dir / "OK" / source.name
+            category_dir = args.output_dir / "OK"
             verdict = "OK"
         else:
             stats.ng += 1
-            target = args.output_dir / "NG" / decision.folder / source.name
+            category_dir = args.output_dir / "NG" / decision.folder
             verdict = f"NG/{decision.folder}"
         _LOGGER.info("%s -> %s (%s)", source, verdict, decision.reason)
 
-        final = unique_output(target, used_outputs, args.on_exists)
-        if final is None:
+        targets = unique_output_targets(
+            category_dir,
+            source.name,
+            used_outputs,
+            args.on_exists,
+        )
+        if targets is None:
             stats.skipped_existing += 1
             continue
-        used_outputs.add(final)
+        used_outputs.update(targets.all())
 
         if args.dry_run:
             continue
         try:
-            save_annotated_result(result, final)
+            save_review_artifacts(
+                result=result,
+                source=source,
+                targets=targets,
+                detections=detections,
+                image_size=(width, height),
+            )
             stats.saved += 1
         except (OSError, ValueError) as exc:
-            _LOGGER.warning("Could not save %s: %s", final, exc)
+            _LOGGER.warning(
+                "Could not save artifacts for %s: %s",
+                source,
+                exc,
+            )
             stats.save_errors += 1
 
     _LOGGER.info(

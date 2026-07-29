@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 from scripts.yolo_classify import (
     Detection,
     bbox_is_contained,
     bbox_is_in_image_center,
     classify_detections,
+    unique_output_targets,
+    write_pascal_voc,
 )
 
 
@@ -114,6 +119,68 @@ class ClassificationTest(unittest.TestCase):
 
         self.assertFalse(result.is_ok)
         self.assertEqual(result.folder, "_no_detection")
+
+
+class ReviewArtifactTest(unittest.TestCase):
+    def test_voc_xml_contains_image_metadata_and_all_detections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = Path(temporary) / "OK" / "original" / "part.jpg"
+            annotation = original.with_suffix(".xml")
+            items = [
+                detection(5, "component_ok", (10.2, 20.8, 50.1, 80.9)),
+                detection(1, "scratch & dent", (-2.0, 30.0, 105.0, 40.0)),
+            ]
+
+            write_pascal_voc(
+                annotation,
+                original,
+                image_size=(100, 90),
+                depth=3,
+                detections=items,
+            )
+
+            root = ET.parse(annotation).getroot()
+            self.assertEqual(root.findtext("folder"), "original")
+            self.assertEqual(root.findtext("filename"), "part.jpg")
+            self.assertEqual(root.findtext("size/width"), "100")
+            self.assertEqual(root.findtext("size/height"), "90")
+            self.assertEqual(root.findtext("size/depth"), "3")
+            objects = root.findall("object")
+            self.assertEqual(
+                [item.findtext("name") for item in objects],
+                ["component_ok", "scratch & dent"],
+            )
+            self.assertEqual(objects[0].findtext("bndbox/xmin"), "10")
+            self.assertEqual(objects[0].findtext("bndbox/ymin"), "20")
+            self.assertEqual(objects[0].findtext("bndbox/xmax"), "51")
+            self.assertEqual(objects[0].findtext("bndbox/ymax"), "81")
+            self.assertEqual(objects[1].findtext("truncated"), "1")
+            self.assertEqual(objects[1].findtext("bndbox/xmin"), "0")
+            self.assertEqual(objects[1].findtext("bndbox/xmax"), "100")
+
+    def test_related_outputs_receive_the_same_collision_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            category = Path(temporary) / "NG" / "scratch"
+            base = unique_output_targets(
+                category,
+                "part.jpg",
+                used=set(),
+                on_exists="suffix",
+            )
+            self.assertIsNotNone(base)
+            assert base is not None
+
+            suffixed = unique_output_targets(
+                category,
+                "part.png",
+                used=set(base.all()),
+                on_exists="suffix",
+            )
+            self.assertIsNotNone(suffixed)
+            assert suffixed is not None
+            self.assertEqual(suffixed.inference.name, "part_1.png")
+            self.assertEqual(suffixed.original.name, "part_1.png")
+            self.assertEqual(suffixed.annotation.name, "part_1.xml")
 
 
 if __name__ == "__main__":
