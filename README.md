@@ -1,6 +1,6 @@
 # APL Develop Tools
 
-AOI（自動光學檢測）開發用的工具集合。目前包含四支 CLI：
+AOI（自動光學檢測）開發用的工具集合。目前包含五支 CLI：
 
 | 工具 | 說明 |
 | --- | --- |
@@ -8,12 +8,14 @@ AOI（自動光學檢測）開發用的工具集合。目前包含四支 CLI：
 | [`scripts/crop_components.py`](scripts/crop_components.py) | 依元件清單篩選影像，從同名 XML 讀取 bbox 並裁切元件 |
 | [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
 | [`scripts/rotate_images.py`](scripts/rotate_images.py) | 依 pixel size 判斷方向，將影像統一旋轉為橫向或豎向 |
+| [`scripts/yolo_classify.py`](scripts/yolo_classify.py) | 使用 Ultralytics YOLO 推論，依 bbox 與 label 規則分類保存到 OK/NG |
 
 ## 環境需求
 
 - Python >= 3.12
 - [uv](https://docs.astral.sh/uv/)
 - Pillow >= 12.3.0（由 uv 自動安裝）
+- Ultralytics >= 8.3.0（由 uv 自動安裝）
 
 ## 安裝
 
@@ -315,6 +317,85 @@ uv run scripts/rotate_images.py \
 正方形影像（`width == height`）旋轉 90° 後方向不變，因此會原樣複製，並在統計的
 `square` 欄位中顯示。無法讀取或寫入任一影像時，程式會繼續處理其餘檔案，最後以
 離開碼 `1` 結束；輸入路徑無效時為 `2`，全部成功時為 `0`。
+
+## yolo_classify.py
+
+使用 Ultralytics YOLO 模型遞迴推論影像，將畫有 bbox、label 與 confidence 的結果
+存到 `OK` 或 `NG` 資料夾。
+
+### 判定規則
+
+影像必須同時符合以下條件才是 OK：
+
+1. `--ok-label` 的偵測數量精確等於 `--ok-count`。
+2. 每個 OK bbox 的中心點都位於影像中央區域。
+3. 其他 label 的 bbox 沒有完整落在任一 OK bbox 內。
+
+其他 label 位於所有 OK bbox 外時不影響結果；沒有偵測到 OK label、但有其他 label
+時，直接判為 NG。若有多個有效 NG label，影像放在 class id 最小的 label 子資料夾。
+
+輸出結構：
+
+```text
+<output-dir>/
+├── OK/
+│   └── image.jpg
+└── NG/
+    ├── scratch/          # NG label 名稱
+    │   └── image.jpg
+    ├── _ok_rule/         # OK 數量或中心位置不符，且沒有有效 NG label
+    └── _no_detection/    # 完全沒有 detection
+```
+
+### 基本用法
+
+例如模型中的 `component_ok` 必須出現一次：
+
+```bash
+uv sync
+uv run scripts/yolo_classify.py \
+    --model ./best.pt \
+    --source ./IMAGES \
+    --output-dir ./RESULTS \
+    --ok-label component_ok \
+    --ok-count 1
+```
+
+`--center-tolerance 0.25`（預設）代表 OK bbox 的中心點必須位於影像寬與高的中央
+50% 區域。若要更嚴格限制在中央 20%，可設為 `0.10`：
+
+```bash
+uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
+    --ok-label component_ok --ok-count 1 --center-tolerance 0.10
+```
+
+只推論並顯示每張圖的判定，不寫入影像：
+
+```bash
+uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
+    --ok-label component_ok --ok-count 1 --dry-run
+```
+
+### 主要參數
+
+| 參數 | 預設 | 說明 |
+| --- | --- | --- |
+| `-m`, `--model` | （必填） | `.pt` 模型路徑或 Ultralytics 模型名稱 |
+| `-s`, `--source` | （必填） | 單一影像或要遞迴搜尋的目錄 |
+| `-o`, `--output-dir` | （必填） | 輸出根目錄 |
+| `--ok-label` | （必填） | 模型中代表 OK 的完整 label name，區分大小寫 |
+| `--ok-count` | （必填） | 必須偵測到的精確 OK 數量，至少為 1 |
+| `--center-tolerance` | `0.25` | bbox 中心相對影像中心的水平、垂直容許比例 |
+| `--conf` | `0.25` | YOLO confidence threshold |
+| `--iou` | `0.7` | YOLO NMS IoU threshold |
+| `--imgsz` | `640` | 推論影像尺寸 |
+| `--device` | 自動 | 例如 `cpu`、`mps` 或 CUDA device `0` |
+| `--max-det` | `300` | 每張影像最大 detection 數 |
+| `--on-exists` | `suffix` | 已存在時：`suffix` / `skip` / `overwrite` |
+| `--dry-run` | 關閉 | 執行推論與分類，但不寫入影像 |
+
+單張影像推論或儲存失敗不會中斷整批工作，最後離開碼為 `1`；來源／模型／label
+無效時為 `2`；全部成功時為 `0`。
 
 ## 開發
 
