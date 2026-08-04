@@ -1,6 +1,6 @@
 # APL Develop Tools
 
-AOI（自動光學檢測）開發用的工具集合。目前包含五支 CLI：
+AOI（自動光學檢測）開發用的工具集合。目前包含六支 CLI：
 
 | 工具 | 說明 |
 | --- | --- |
@@ -9,6 +9,7 @@ AOI（自動光學檢測）開發用的工具集合。目前包含五支 CLI：
 | [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
 | [`scripts/rotate_images.py`](scripts/rotate_images.py) | 依 pixel size 判斷方向，將影像統一旋轉為橫向或豎向 |
 | [`scripts/yolo_classify.py`](scripts/yolo_classify.py) | 使用 Ultralytics YOLO 推論，依 bbox 與 label 規則分類保存到 OK/NG |
+| [`scripts/e2e_infer.py`](scripts/e2e_infer.py) | end-to-end 推論驗證：方向校正 → YOLO → HOAM 類別路由 → anomaly 模型 |
 
 ## 環境需求
 
@@ -16,11 +17,18 @@ AOI（自動光學檢測）開發用的工具集合。目前包含五支 CLI：
 - [uv](https://docs.astral.sh/uv/)
 - Pillow >= 12.3.0（由 uv 自動安裝）
 - Ultralytics >= 8.3.0（由 uv 自動安裝）
+- `e2e_infer.py` 另外需要 `e2e` extra（anomalib、torch、faiss-cpu 等）
 
 ## 安裝
 
 ```bash
 uv sync
+```
+
+要跑 `e2e_infer.py` 時改用：
+
+```bash
+uv sync --extra e2e
 ```
 
 ## crop_images.py
@@ -396,6 +404,139 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 
 單張影像推論或儲存失敗不會中斷整批工作，最後離開碼為 `1`；來源／模型／label
 無效時為 `2`；全部成功時為 `0`。
+
+## e2e_infer.py
+
+把 APL 的四個推論步驟串成一支程式，並輸出可逐張檢查的驗證報告。
+
+### 流程
+
+```text
+1. 方向校正   讀取影像或資料夾，依 pixel size 判斷方向，把直的轉成橫的
+2. YOLO 閘門  套用 yolo_classify.py 的 OK/NG 規則
+              NG -> <output-dir>/NG/<label>/ 後結束；OK -> 進入下一步
+3. 類別路由   anomaly_dino / patchcore：用訓練好的 HOAMV2 KNN index 判斷類別
+              dinomaly：跳過（單一模型涵蓋所有類別）
+4. 異常推論   以該類別對應的 anomalib checkpoint 推論
+              -> <output-dir>/anomaly/[<class>/]<OK|NG>/
+```
+
+輸出結構：
+
+```text
+<output-dir>/
+├── OK/                       # 只有加上 --save-ok-annotated 才會產生
+├── NG/<label>/               # YOLO 判 NG 的標註影像
+├── anomaly/
+│   └── R1005/                # 有做類別路由時才有這層
+│       ├── OK/
+│       └── NG/
+│           ├── image.jpg          # 實際送進模型的影像
+│           └── image_result.png   # 原圖 | heat-map | pred mask
+├── report.json               # 執行參數、統計、每張影像的完整軌跡
+├── report.csv                # 同上，方便用 Excel 檢視
+└── _work/                    # 旋轉後的暫存影像與送入 anomalib 的 symlink
+```
+
+`report.csv` 每列記錄一張影像走過的每一站：方向、是否旋轉、YOLO 判定與理由、
+HOAM 類別、使用的 checkpoint、anomaly score 與判定、以及所有輸出路徑。
+
+### 安裝
+
+這支程式需要 anomalib 與 HOAM 的相依套件，屬於選用的 `e2e` extra：
+
+```bash
+uv sync --extra e2e
+```
+
+HOAM 本身不透過套件安裝，執行時用 `--hoam-root` 指向 HOAM repo 即可
+（程式會把 `<hoam-root>/src` 加進 `sys.path`）。
+
+### 基本用法
+
+dinomaly：不做類別路由，`--anomaly-model-dir` 直接放 checkpoint。
+
+```bash
+uv run scripts/e2e_infer.py \
+    --input ./IMAGES --output-dir ./RESULTS \
+    --yolo-model ./models/yolo/best.pt \
+    --ok-label component_ok --ok-count 1 \
+    --anomaly-model dinomaly \
+    --anomaly-model-dir ./models/dinomaly
+```
+
+patchcore / anomalydino：先用 HOAM 判類別，再挑對應資料夾底下的模型。
+
+```bash
+uv run scripts/e2e_infer.py \
+    --input ./IMAGES --output-dir ./RESULTS \
+    --yolo-model ./models/yolo/best.pt \
+    --ok-label component_ok --ok-count 1 \
+    --anomaly-model patchcore \
+    --anomaly-model-dir ./models/patchcore \
+    --anomaly-image-size 256 \
+    --hoam-root ../HOAM \
+    --hoam-model-path ./models/hoam/best.pt
+```
+
+此時 `--anomaly-model-dir` 的結構是每個類別一個子資料夾，名稱要和 HOAM 的
+類別名稱一致；每個子資料夾底下遞迴尋找 `*.ckpt`，取最新的一個：
+
+```text
+./models/patchcore/
+├── R1005/.../model.ckpt
+└── C0402/.../model.ckpt
+```
+
+HOAM 的 `knn.index`、`dataset.pkl`、`mean_std.json`、`config_used.yaml` 預設
+從 `--hoam-model-path` 所在目錄尋找（也就是 `hoam build-knn` 的輸出位置），
+需要時再用 `--hoam-index` 等參數個別指定。
+
+只跑方向校正與 YOLO，確認流程與判定，不寫入影像：
+
+```bash
+uv run scripts/e2e_infer.py -i ./IMAGES -o ./RESULTS \
+    --yolo-model ./models/yolo/best.pt --ok-label component_ok --ok-count 1 \
+    --anomaly-model dinomaly --anomaly-model-dir ./models/dinomaly --dry-run
+```
+
+### 主要參數
+
+| 參數 | 預設 | 說明 |
+| --- | --- | --- |
+| `-i`, `--input` | （必填） | 單一影像或要遞迴搜尋的目錄 |
+| `-o`, `--output-dir` | （必填） | 輸出根目錄 |
+| `--work-dir` | `<output-dir>/_work` | 旋轉後影像與 anomalib 輸入的暫存目錄 |
+| `--limit` | 無 | 只處理前 N 張，適合先跑小批驗證 |
+| `--target-orientation` | `landscape` | 所有非正方形影像要轉成的方向 |
+| `--yolo-model` | （必填） | YOLO `.pt` 模型路徑或名稱 |
+| `--ok-label` / `--ok-count` | （必填） | 與 `yolo_classify.py` 完全相同的規則 |
+| `--center-tolerance` | `0.25` | OK bbox 中心相對影像中心的容許比例 |
+| `--save-ok-annotated` | 關閉 | 另外把 YOLO 判 OK 的標註影像寫到 `OK/` |
+| `--anomaly-model` | （必填） | `dinomaly` / `anomaly_dino` / `patchcore`，接受 `anomalydino`、`patch-core` 等別名 |
+| `--anomaly-model-dir` | （必填） | 模型根目錄；有類別路由時每個類別一個子資料夾 |
+| `--anomaly-ckpt` | 無 | 指定單一 checkpoint，等於跳過類別路由 |
+| `--anomaly-image-size` | 無 | `448` 或 `448x448`；未指定時 batch size 會被降為 1，避免不同尺寸無法合批 |
+| `--anomaly-threshold` | 無 | 改用分數比較，取代 checkpoint 自帶的 OK/NG 判定 |
+| `--no-result-image` | 關閉 | 不輸出 `*_result.png` |
+| `--hoam-root` | 無 | HOAM repo 路徑（或其 `src`），未安裝 hoam 套件時必填 |
+| `--hoam-model-path` | 見說明 | HOAMV2 `.pt`；`anomaly_dino` / `patchcore` 且未給 `--anomaly-ckpt` 時必填 |
+| `--hoam-k` | `1` | KNN 取幾個鄰居，類別採多數決，同票時取最近的 |
+| `--accelerator` / `--devices` | `auto` | Lightning 的 accelerator 與 device 設定 |
+| `--on-exists` | `suffix` | 已存在時：`suffix` / `skip` / `overwrite` |
+| `--dry-run` | 關閉 | 只跑方向校正與 YOLO 判定，不寫影像、不做異常推論 |
+
+單張影像失敗只會記在該列的 `error` 欄位，不會中斷整批；最後只要有任何錯誤離開碼
+為 `1`，參數或模型設定不合法為 `2`，全部成功為 `0`。
+
+### macOS 注意事項
+
+faiss 與 torch 各自帶了一份 OpenMP runtime，在 macOS 上執行 HOAM 路由時可能出現
+`OMP: Error #15`。加上環境變數即可繼續執行：
+
+```bash
+KMP_DUPLICATE_LIB_OK=TRUE uv run scripts/e2e_infer.py ...
+```
 
 ## 開發
 

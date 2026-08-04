@@ -8,3 +8,17 @@ dependencies = [
     "pillow>=12.3.0",
     "ultralytics>=8.3.0",
 ]
+
+# Only scripts/e2e_infer.py needs these; install with `uv sync --extra e2e`.
+# The HOAM package itself is loaded from its repository via --hoam-root.
+[project.optional-dependencies]
+e2e = [
+    "anomalib>=2.1.0",
+    "faiss-cpu>=1.8.0",
+    "joblib>=1.3.0",
+    "omegaconf>=2.3.0",
+    "pytorch-metric-learning>=2.3.0",
+    "timm>=0.9.0",
+    "torch>=2.2",
+    "torchvision>=0.17",
+]
