@@ -426,7 +426,8 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 ### 流程
 
 ```text
-1. 方向校正   讀取影像或資料夾，依 pixel size 判斷方向，把直的轉成橫的
+1. 光源篩選   讀取影像或資料夾，依 --light 選出指定光源的影像（預設 all 不篩選）
+   方向校正   依 pixel size 判斷方向，把直的轉成橫的
 2. YOLO 閘門  套用 yolo_classify.py 的 OK/NG 規則與複判素材輸出
               NG -> <output-dir>/NG/<label>/ 後結束；OK -> 進入下一步
 3. 類別路由   anomaly_dino / patchcore：用訓練好的 HOAMV2 KNN index 判斷類別
@@ -510,7 +511,28 @@ HOAM 的 `knn.index`、`dataset.pkl`、`mean_std.json`、`config_used.yaml` 預�
 從 `--hoam-model-path` 所在目錄尋找（也就是 `hoam build-knn` 的輸出位置），
 需要時再用 `--hoam-index` 等參數個別指定。
 
-只跑方向校正與 YOLO，確認流程與判定，不寫入影像：
+### 光源篩選
+
+檔名規則與 `group_images.py` 相同：
+
+```
+{Component Name}_{Pad ID}_{光源}.jpg
+```
+
+預設 `--light all` 不看光源，資料夾裡的每張影像都推論；要只推論單一光源時：
+
+```bash
+uv run scripts/e2e_infer.py -i ./IMAGES -o ./RESULTS --light SolderLight \
+    --yolo-model ./models/yolo/best.pt --ok-label component_ok --ok-count 1 \
+    --anomaly-model dinomaly --anomaly-model-dir ./models/dinomaly
+```
+
+光源比對忽略大小寫且由右往左找，所以 `crop_images.py` 加上的 `_1`、`_2` 後綴
+（`C1_1_SolderLight_1.jpg`）仍能正確解析。指定光源時，檔名解析不出光源的影像會
+記 warning 並跳過，統計分別計入 `other_light`（光源不符）與 `light_unparsed`
+（檔名不符規則）；`--light all` 則不解析檔名，兩個計數都會是 0。
+
+只跑光源篩選、方向校正與 YOLO，確認流程與判定，不寫入影像：
 
 ```bash
 uv run scripts/e2e_infer.py -i ./IMAGES -o ./RESULTS \
@@ -525,7 +547,8 @@ uv run scripts/e2e_infer.py -i ./IMAGES -o ./RESULTS \
 | `-i`, `--input` | （必填） | 單一影像或要遞迴搜尋的目錄 |
 | `-o`, `--output-dir` | （必填） | 輸出根目錄 |
 | `--work-dir` | `<output-dir>/_work` | 旋轉後影像與 anomalib 輸入的暫存目錄 |
-| `--limit` | 無 | 只處理前 N 張，適合先跑小批驗證 |
+| `--limit` | 無 | 只處理前 N 張（在光源篩選之後），適合先跑小批驗證 |
+| `-l`, `--light` | `all` | 只推論指定光源：`SolderLight` / `UniformLight` / `all`，忽略大小寫 |
 | `--target-orientation` | `landscape` | 所有非正方形影像要轉成的方向 |
 | `--yolo-model` | （必填） | YOLO `.pt` 模型路徑或名稱 |
 | `--ok-label` / `--ok-count` | （必填） | 與 `yolo_classify.py` 完全相同的規則 |

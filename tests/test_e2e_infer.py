@@ -11,6 +11,7 @@ from PIL import Image
 from scripts.e2e_infer import (
     ImageTrace,
     Stats,
+    filter_by_light,
     normalize_anomaly_model,
     orient_images,
     parse_image_size,
@@ -46,6 +47,44 @@ class ImageSizeTest(unittest.TestCase):
     def test_square_and_pair(self) -> None:
         self.assertEqual(parse_image_size("448"), (448, 448))
         self.assertEqual(parse_image_size("256x320"), (256, 320))
+
+
+class LightFilterTest(unittest.TestCase):
+    def pairs(self, *names: str) -> list[tuple[Path, Path]]:
+        return [(Path("/in") / name, Path(name)) for name in names]
+
+    def test_all_keeps_every_image_including_unparsable_names(self) -> None:
+        stats = Stats()
+        pairs = self.pairs("C1_1_SolderLight.jpg", "anything.jpg")
+        self.assertEqual(filter_by_light(pairs, "all", stats), pairs)
+        self.assertEqual(stats.other_light, 0)
+        self.assertEqual(stats.light_unparsed, 0)
+
+    def test_only_the_requested_light_is_kept(self) -> None:
+        stats = Stats()
+        pairs = self.pairs(
+            "C1_1_SolderLight.jpg",
+            "C1_1_UniformLight.jpg",
+            "U5_A_3_SolderLight.jpg",
+        )
+        selected = filter_by_light(pairs, "SolderLight", stats)
+        self.assertEqual(
+            [source.name for source, _ in selected],
+            ["C1_1_SolderLight.jpg", "U5_A_3_SolderLight.jpg"],
+        )
+        self.assertEqual(stats.other_light, 1)
+
+    def test_dedup_suffix_still_resolves(self) -> None:
+        stats = Stats()
+        pairs = self.pairs("C1_1_SolderLight_1.jpg")
+        self.assertEqual(len(filter_by_light(pairs, "SolderLight", stats)), 1)
+
+    def test_unparsable_names_are_counted_and_skipped(self) -> None:
+        stats = Stats()
+        pairs = self.pairs("image.jpg", "C1_1_SolderLight.jpg")
+        selected = filter_by_light(pairs, "SolderLight", stats)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(stats.light_unparsed, 1)
 
 
 class OrientationTest(unittest.TestCase):

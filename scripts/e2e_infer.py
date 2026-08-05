@@ -3,8 +3,11 @@
 
 The pipeline has four stages:
 
-1. **Orientation** - one image or a directory is scanned; portrait images are
-   rotated to landscape so every downstream model sees the same layout.
+1. **Light source and orientation** - one image or a directory is scanned.
+   ``--light`` keeps only the images of one light source, read from the
+   ``{Component}_{PadID}_{Light}`` file name, or infers every image when left
+   at ``all``.  Portrait images are then rotated to landscape so every
+   downstream model sees the same layout.
 2. **YOLO gate** - the trained detector runs on the oriented image and the
    OK/NG rules of :mod:`scripts.yolo_classify` are applied.  NG images are
    written to ``<output-dir>/NG/<label>/`` and leave the pipeline; OK images
@@ -56,6 +59,12 @@ if str(_REPO_ROOT) not in sys.path:
     # Allow both `uv run scripts/e2e_infer.py` and `import scripts.e2e_infer`.
     sys.path.insert(0, str(_REPO_ROOT))
 
+from scripts.group_images import (  # noqa: E402
+    _ALL as ANY_LIGHT,
+    _LIGHTS,
+    _light_arg as light_argument,
+    parse_stem,
+)
 from scripts.rotate_images import (  # noqa: E402
     _save_rotated as save_rotated,
     find_images,
@@ -139,6 +148,9 @@ class ImageTrace:
 class Stats:
     """Counters for one pipeline run."""
 
+    images_found: int = 0
+    other_light: int = 0
+    light_unparsed: int = 0
     images_seen: int = 0
     rotated: int = 0
     orient_errors: int = 0
@@ -177,8 +189,51 @@ class HoamSettings:
 
 
 # --------------------------------------------------------------------------- #
-# Stage 1: orientation
+# Stage 1: light-source selection and orientation
 # --------------------------------------------------------------------------- #
+def filter_by_light(
+    pairs: Sequence[tuple[Path, Path]],
+    light: str,
+    stats: Stats,
+) -> list[tuple[Path, Path]]:
+    """Keeps the images whose file name carries the requested light source.
+
+    File names follow ``{Component}_{PadID}_{Light}`` as produced by
+    ``crop_images.py``; parsing is shared with ``group_images.py``, so a
+    de-duplication suffix such as ``C1_1_SolderLight_1`` still resolves.  With
+    ``light`` set to ``all`` every image is kept and no name is parsed, which
+    is what an input directory of one light source already needs.
+
+    Args:
+        pairs: ``(source, relative_path)`` pairs from ``find_images``.
+        light: Canonical light name, or ``all`` to ignore the light source.
+        stats: Counters updated in place.
+
+    Returns:
+        The selected pairs, in input order.
+    """
+    if light == ANY_LIGHT:
+        return list(pairs)
+
+    selected: list[tuple[Path, Path]] = []
+    for source, relative in pairs:
+        parsed = parse_stem(source.stem)
+        if parsed is None:
+            _LOGGER.warning(
+                "Name does not match {Component}_{Pad}_{Light}: %s", source
+            )
+            stats.light_unparsed += 1
+            continue
+        if parsed[1] != light:
+            _LOGGER.debug(
+                "Light %s not requested, skipping %s", parsed[1], source.name
+            )
+            stats.other_light += 1
+            continue
+        selected.append((source, relative))
+    return selected
+
+
 def orient_images(
     pairs: Sequence[tuple[Path, Path]],
     work_dir: Path,
@@ -1163,6 +1218,7 @@ def write_report(
     payload = {
         "input": str(args.input),
         "output_dir": str(args.output_dir),
+        "light": args.light,
         "yolo_model": str(args.yolo_model),
         "ok_label": args.ok_label,
         "ok_count": args.ok_count,
@@ -1243,7 +1299,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Process at most this many images (useful for smoke tests).",
     )
 
-    orientation = parser.add_argument_group("stage 1: orientation")
+    orientation = parser.add_argument_group("stage 1: light source and orientation")
+    orientation.add_argument(
+        "-l", "--light", type=light_argument, default=ANY_LIGHT,
+        metavar="LIGHT",
+        help=f"Only infer images of this light source: {', '.join(_LIGHTS)}, "
+             f"or '{ANY_LIGHT}' to ignore the light source and infer every "
+             "image. Read from the {Component}_{Pad}_{Light} file name.",
+    )
     orientation.add_argument(
         "--target-orientation", choices=("landscape", "portrait"),
         default="landscape",
@@ -1441,13 +1504,28 @@ def main(argv: list[str] | None = None) -> int:
         value.lower() if value.startswith(".") else f".{value.lower()}"
         for value in args.ext
     )
+    stats = Stats()
     pairs = find_images(args.input, args.output_dir, extensions)
+    stats.images_found = len(pairs)
     if not pairs:
         _LOGGER.warning("No images found under %s", args.input)
         return 0
-    if args.limit is not None:
+
+    pairs = filter_by_light(pairs, args.light, stats)
+    _LOGGER.info(
+        "Found %d image(s) from %s%s",
+        stats.images_found,
+        args.input,
+        ""
+        if args.light == ANY_LIGHT
+        else f"; {len(pairs)} with light source {args.light}",
+    )
+    if not pairs:
+        _LOGGER.warning("No image carries light source %s", args.light)
+        return 0
+    if args.limit is not None and args.limit < len(pairs):
         pairs = pairs[: args.limit]
-    _LOGGER.info("Found %d image(s) from %s", len(pairs), args.input)
+        _LOGGER.info("Limited to the first %d image(s)", len(pairs))
 
     needs_routing = needs_class_routing(args)
     hoam_settings: HoamSettings | None = None
@@ -1460,7 +1538,6 @@ def main(argv: list[str] | None = None) -> int:
             _LOGGER.error("%s", exc)
             return 2
 
-    stats = Stats()
     traces = orient_images(
         pairs=pairs,
         work_dir=args.work_dir / "oriented",
