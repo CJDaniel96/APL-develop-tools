@@ -427,7 +427,7 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 
 ```text
 1. 方向校正   讀取影像或資料夾，依 pixel size 判斷方向，把直的轉成橫的
-2. YOLO 閘門  套用 yolo_classify.py 的 OK/NG 規則
+2. YOLO 閘門  套用 yolo_classify.py 的 OK/NG 規則與複判素材輸出
               NG -> <output-dir>/NG/<label>/ 後結束；OK -> 進入下一步
 3. 類別路由   anomaly_dino / patchcore：用訓練好的 HOAMV2 KNN index 判斷類別
               dinomaly：跳過（單一模型涵蓋所有類別）
@@ -440,7 +440,11 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 ```text
 <output-dir>/
 ├── OK/                       # 只有加上 --save-ok-annotated 才會產生
-├── NG/<label>/               # YOLO 判 NG 的標註影像
+│   ├── inference/image.jpg
+│   └── original/image.jpg + image.xml
+├── NG/<label>/               # 與 yolo_classify.py 相同的 CVAT 複判結構
+│   ├── inference/image.jpg        # 畫上 bbox 的結果
+│   └── original/image.jpg + image.xml
 ├── anomaly/
 │   └── R1005/                # 有做類別路由時才有這層
 │       ├── OK/
@@ -526,7 +530,7 @@ uv run scripts/e2e_infer.py -i ./IMAGES -o ./RESULTS \
 | `--yolo-model` | （必填） | YOLO `.pt` 模型路徑或名稱 |
 | `--ok-label` / `--ok-count` | （必填） | 與 `yolo_classify.py` 完全相同的規則 |
 | `--center-tolerance` | `0.25` | OK bbox 中心相對影像中心的容許比例 |
-| `--save-ok-annotated` | 關閉 | 另外把 YOLO 判 OK 的標註影像寫到 `OK/` |
+| `--save-ok-annotated` | 關閉 | 另外把 YOLO 判 OK 的複判素材寫到 `OK/` |
 | `--anomaly-model` | （必填） | `dinomaly` / `anomaly_dino` / `patchcore`，接受 `anomalydino`、`patch-core` 等別名 |
 | `--anomaly-model-dir` | （必填） | 模型根目錄；有類別路由時每個類別一個子資料夾 |
 | `--anomaly-ckpt` | 無 | 指定單一 checkpoint，等於跳過類別路由 |

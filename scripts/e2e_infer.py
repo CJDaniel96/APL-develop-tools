@@ -62,13 +62,14 @@ from scripts.rotate_images import (  # noqa: E402
     orientation_for_size,
 )
 from scripts.yolo_classify import (  # noqa: E402
+    OutputTargets,
     classify_detections,
     detections_from_result,
     normalize_names,
     resolve_ok_class_id,
     safe_folder_name,
-    save_annotated_result,
-    unique_output,
+    save_review_artifacts,
+    unique_output_targets,
 )
 
 _LOGGER = logging.getLogger("e2e_infer")
@@ -314,12 +315,18 @@ def run_yolo_stage(
             passed.append(trace)
             _LOGGER.info("%s -> YOLO OK (%s)", source, decision.reason)
             if args.save_ok_annotated:
-                target = args.output_dir / "OK" / source.name
-                saved = _save_yolo_image(
-                    result, target, used_outputs, args.on_exists, args.dry_run
+                saved = _save_yolo_artifacts(
+                    result=result,
+                    scored=oriented,
+                    filename=source.name,
+                    category_dir=args.output_dir / "OK",
+                    detections=detections,
+                    image_size=(width, height),
+                    used_outputs=used_outputs,
+                    args=args,
                 )
                 if saved is not None:
-                    trace.yolo_output = str(saved)
+                    trace.yolo_output = str(saved.inference)
             continue
 
         trace.yolo_verdict = "NG"
@@ -328,37 +335,72 @@ def run_yolo_stage(
         _LOGGER.info(
             "%s -> YOLO NG/%s (%s)", source, decision.folder, decision.reason
         )
-        target = args.output_dir / "NG" / decision.folder / source.name
-        saved = _save_yolo_image(
-            result, target, used_outputs, args.on_exists, args.dry_run
+        saved = _save_yolo_artifacts(
+            result=result,
+            scored=oriented,
+            filename=source.name,
+            category_dir=args.output_dir / "NG" / decision.folder,
+            detections=detections,
+            image_size=(width, height),
+            used_outputs=used_outputs,
+            args=args,
         )
         if saved is not None:
-            trace.yolo_output = str(saved)
+            trace.yolo_output = str(saved.inference)
     return passed
 
 
-def _save_yolo_image(
+def _save_yolo_artifacts(
     result: Any,
-    target: Path,
+    scored: Path,
+    filename: str,
+    category_dir: Path,
+    detections: Sequence[Any],
+    image_size: tuple[int, int],
     used_outputs: set[Path],
-    on_exists: str,
-    dry_run: bool,
-) -> Path | None:
-    """Saves one annotated YOLO image, honouring the collision policy."""
-    final = unique_output(target, used_outputs, on_exists)
-    if final is None:
-        _LOGGER.debug("Exists, skipping: %s", target)
+    args: argparse.Namespace,
+) -> OutputTargets | None:
+    """Saves the review artifacts of one image, as ``yolo_classify`` does.
+
+    The copied original and the VOC annotation describe ``scored`` - the
+    oriented image the detector actually saw - so the boxes match the pixels,
+    while the file name stays the one of the pipeline's input image.
+
+    Args:
+        result: Ultralytics result for ``scored``.
+        scored: Image that was passed to the detector.
+        filename: Output file name, taken from the original input image.
+        category_dir: ``OK`` or ``NG/<label>`` directory.
+        detections: Detections written to the VOC annotation.
+        image_size: ``(width, height)`` of ``scored``.
+        used_outputs: Paths already reserved during this run.
+        args: Parsed CLI arguments.
+
+    Returns:
+        The written paths, or None when nothing was written.
+    """
+    targets = unique_output_targets(
+        category_dir, filename, used_outputs, args.on_exists
+    )
+    if targets is None:
+        _LOGGER.debug("Exists, skipping: %s", category_dir / filename)
         return None
-    used_outputs.add(final)
-    if dry_run:
-        _LOGGER.info("[dry-run] write %s", final)
-        return final
+    used_outputs.update(targets.all())
+    if args.dry_run:
+        _LOGGER.info("[dry-run] write %s", targets.inference)
+        return targets
     try:
-        save_annotated_result(result, final)
+        save_review_artifacts(
+            result=result,
+            source=scored,
+            targets=targets,
+            detections=detections,
+            image_size=image_size,
+        )
     except (OSError, ValueError) as exc:
-        _LOGGER.warning("Could not save %s: %s", final, exc)
+        _LOGGER.warning("Could not save %s: %s", targets.inference, exc)
         return None
-    return final
+    return targets
 
 
 # --------------------------------------------------------------------------- #
@@ -703,6 +745,7 @@ def run_anomaly_stage(
         _LOGGER.warning("No image reached the anomaly stage")
         return
 
+    used_outputs: set[Path] = set()
     for class_name, group in groups.items():
         label = class_name or _UNROUTED_GROUP
         try:
@@ -730,7 +773,9 @@ def run_anomaly_stage(
             continue
 
         try:
-            _predict_group(group, class_name, checkpoint, args, stats)
+            _predict_group(
+                group, class_name, checkpoint, used_outputs, args, stats
+            )
         except Exception as exc:  # Report and continue with the next class.
             _LOGGER.error("Anomaly inference failed for class %s: %s", label, exc)
             for trace in group:
@@ -743,6 +788,7 @@ def _predict_group(
     group: Sequence[ImageTrace],
     class_name: str | None,
     checkpoint: Path,
+    used_outputs: set[Path],
     args: argparse.Namespace,
     stats: Stats,
 ) -> None:
@@ -795,7 +841,13 @@ def _predict_group(
             _LOGGER.warning("Unmatched prediction for %s", record["path"])
             continue
         _save_anomaly_result(
-            trace, record, class_name, checkpoint_threshold, args, stats
+            trace,
+            record,
+            class_name,
+            checkpoint_threshold,
+            used_outputs,
+            args,
+            stats,
         )
 
     for trace in group:
@@ -884,6 +936,7 @@ def _save_anomaly_result(
     record: dict[str, Any],
     class_name: str | None,
     checkpoint_threshold: float | None,
+    used_outputs: set[Path],
     args: argparse.Namespace,
     stats: Stats,
 ) -> None:
@@ -925,10 +978,11 @@ def _save_anomaly_result(
     parts.append(verdict)
     source = Path(trace.source)
     target_dir = args.output_dir.joinpath(*parts)
-    target = unique_output(target_dir / source.name, set(), args.on_exists)
+    target = _unique_path(target_dir / source.name, used_outputs, args.on_exists)
     if target is None:
         _LOGGER.debug("Exists, skipping: %s", target_dir / source.name)
         return
+    used_outputs.add(target)
 
     scored = _scored_path(trace)
     try:
@@ -1044,6 +1098,34 @@ def _jet(values: Any) -> Any:
     green = np.clip(np.minimum(4 * clipped - 0.5, -4 * clipped + 3.5), 0, 1)
     blue = np.clip(np.minimum(4 * clipped + 0.5, -4 * clipped + 2.5), 0, 1)
     return (np.stack([red, green, blue], axis=-1) * 255).astype("uint8")
+
+
+def _unique_path(target: Path, used: set[Path], on_exists: str) -> Path | None:
+    """Chooses a non-colliding output path according to the CLI policy.
+
+    ``yolo_classify`` reserves three related review paths at once; the anomaly
+    stage writes one image per decision, so it needs the single-path variant.
+
+    Args:
+        target: Desired output path.
+        used: Paths already reserved during this run.
+        on_exists: ``suffix``, ``skip`` or ``overwrite``.
+
+    Returns:
+        The path to write, or None when an existing file should be skipped.
+    """
+    if target not in used:
+        if not target.exists() or on_exists == "overwrite":
+            return target
+        if on_exists == "skip":
+            return None
+
+    index = 1
+    while True:
+        candidate = target.with_name(f"{target.stem}_{index}{target.suffix}")
+        if candidate not in used and not candidate.exists():
+            return candidate
+        index += 1
 
 
 def _coerce_devices(devices: str) -> Any:
