@@ -14,8 +14,10 @@ The pipeline has four stages:
    continue.
 3. **Class routing** - ``anomaly_dino`` and ``patchcore`` need to know which
    component class an image belongs to, so the trained HOAM/HOAMV2 KNN index
-   assigns one class per OK image.  ``dinomaly`` skips this stage because a
-   single model covers every class.
+   assigns one class per OK image.  For ``anomaly_dino``, the OK YOLO bounding
+   box is cropped first and the crop is used for both routing and anomaly
+   inference.  ``dinomaly`` skips this stage because a single model covers
+   every class.
 4. **Anomaly inference** - the anomalib checkpoint for the routed class (or the
    single ``dinomaly`` checkpoint) scores every OK image.  Image, heat-map
    result and score are written below ``<output-dir>/anomaly/``.
@@ -46,6 +48,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import shutil
 import sys
 from dataclasses import asdict, dataclass, fields
@@ -129,6 +132,8 @@ class ImageTrace:
     yolo_verdict: str = ""
     yolo_reason: str = ""
     yolo_output: str = ""
+    yolo_ok_bbox: tuple[int, int, int, int] | None = None
+    yolo_crop: str = ""
     hoam_class: str = ""
     anomaly_checkpoint: str = ""
     anomaly_score: float | None = None
@@ -157,6 +162,7 @@ class Stats:
     yolo_ok: int = 0
     yolo_ng: int = 0
     yolo_errors: int = 0
+    yolo_crop_errors: int = 0
     routed: int = 0
     routing_errors: int = 0
     anomaly_ok: int = 0
@@ -365,6 +371,33 @@ def run_yolo_stage(
         trace.yolo_reason = decision.reason
         if decision.is_ok:
             trace.yolo_verdict = "OK"
+            if args.anomaly_model == "anomaly_dino":
+                crop_target = (
+                    args.work_dir / "yolo_ok_crops" / Path(trace.relative)
+                )
+                try:
+                    trace.yolo_ok_bbox = save_yolo_ok_crop(
+                        source=oriented,
+                        target=crop_target,
+                        detections=detections,
+                        ok_class_id=ok_class_id,
+                        image_size=(width, height),
+                        dry_run=args.dry_run,
+                    )
+                    trace.yolo_crop = str(crop_target)
+                    if args.dry_run:
+                        _LOGGER.info(
+                            "[dry-run] crop YOLO OK bbox %s -> %s",
+                            trace.yolo_ok_bbox,
+                            crop_target,
+                        )
+                except (UnidentifiedImageError, OSError, ValueError) as exc:
+                    _LOGGER.warning(
+                        "Could not crop YOLO OK bbox from %s: %s", oriented, exc
+                    )
+                    trace.fail("yolo_crop", str(exc))
+                    stats.yolo_crop_errors += 1
+                    continue
             trace.stage = "yolo_ok"
             stats.yolo_ok += 1
             passed.append(trace)
@@ -403,6 +436,56 @@ def run_yolo_stage(
         if saved is not None:
             trace.yolo_output = str(saved.inference)
     return passed
+
+
+def save_yolo_ok_crop(
+    source: Path,
+    target: Path,
+    detections: Sequence[Any],
+    ok_class_id: int,
+    image_size: tuple[int, int],
+    dry_run: bool = False,
+) -> tuple[int, int, int, int]:
+    """Crops the region covered by the detections of the YOLO OK class.
+
+    A normal run has one OK detection.  If ``--ok-count`` is greater than one,
+    the smallest rectangle containing all OK detections is used so the
+    one-input/one-result trace contract remains intact.  Floating point YOLO
+    coordinates are expanded outwards and clamped to the source image.
+
+    Returns:
+        The integer PIL crop box ``(left, top, right, bottom)``.
+    """
+    width, height = image_size
+    ok_boxes = [
+        detection.bbox
+        for detection in detections
+        if detection.class_id == ok_class_id
+    ]
+    if not ok_boxes:
+        raise ValueError("YOLO OK decision has no OK-class bounding box")
+
+    box = (
+        max(0, min(width, math.floor(min(item[0] for item in ok_boxes)))),
+        max(0, min(height, math.floor(min(item[1] for item in ok_boxes)))),
+        max(0, min(width, math.ceil(max(item[2] for item in ok_boxes)))),
+        max(0, min(height, math.ceil(max(item[3] for item in ok_boxes)))),
+    )
+    if width <= 0 or height <= 0 or box[2] <= box[0] or box[3] <= box[1]:
+        raise ValueError(f"Invalid YOLO OK crop box {box} for {image_size}")
+    if dry_run:
+        return box
+
+    with Image.open(source) as image:
+        image.load()
+        if image.size != image_size:
+            raise ValueError(
+                f"YOLO image size {image_size} does not match source {image.size}"
+            )
+        crop = image.crop(box)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        crop.save(target)
+    return box
 
 
 def _save_yolo_artifacts(
@@ -1197,7 +1280,12 @@ def _coerce_devices(devices: str) -> Any:
 
 
 def _scored_path(trace: ImageTrace) -> Path:
-    """Returns the oriented image if it exists, else the original source."""
+    """Returns the YOLO crop, oriented image, or original, in that order."""
+    crop = Path(trace.yolo_crop) if trace.yolo_crop else None
+    if crop is not None:
+        if not crop.exists():
+            raise FileNotFoundError(f"YOLO OK crop does not exist: {crop}")
+        return crop
     oriented = Path(trace.oriented) if trace.oriented else Path(trace.source)
     return oriented if oriented.exists() else Path(trace.source)
 
@@ -1589,6 +1677,7 @@ def main(argv: list[str] | None = None) -> int:
     errors = (
         stats.orient_errors
         + stats.yolo_errors
+        + stats.yolo_crop_errors
         + stats.routing_errors
         + stats.anomaly_errors
     )

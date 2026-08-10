@@ -11,12 +11,15 @@ from PIL import Image
 from scripts.e2e_infer import (
     ImageTrace,
     Stats,
+    _scored_path,
     filter_by_light,
     normalize_anomaly_model,
     orient_images,
     parse_image_size,
     resolve_checkpoint,
+    save_yolo_ok_crop,
 )
+from scripts.yolo_classify import Detection
 
 
 def write_image(path: Path, size: tuple[int, int]) -> Path:
@@ -211,6 +214,68 @@ class TraceTest(unittest.TestCase):
         first = ImageTrace(source="a.png", relative="a.png")
         second = ImageTrace(source="a.png", relative="a.png")
         self.assertEqual(len({first, second}), 2)
+
+
+class YoloOkCropTest(unittest.TestCase):
+    def test_crop_uses_ok_bbox_and_is_preferred_downstream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_image(root / "source.png", (100, 80))
+            target = root / "work" / "crop.png"
+            detections = [
+                Detection(3, "component_ok", 0.9, (10.2, 20.8, 60.1, 70.2)),
+                Detection(4, "outside_ng", 0.8, (0.0, 0.0, 5.0, 5.0)),
+            ]
+
+            box = save_yolo_ok_crop(
+                source, target, detections, ok_class_id=3, image_size=(100, 80)
+            )
+
+            self.assertEqual(box, (10, 20, 61, 71))
+            with Image.open(target) as crop:
+                self.assertEqual(crop.size, (51, 51))
+            trace = ImageTrace(
+                source=str(source),
+                relative=source.name,
+                oriented=str(source),
+                yolo_crop=str(target),
+            )
+            self.assertEqual(_scored_path(trace), target)
+
+            target.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "crop does not exist"):
+                _scored_path(trace)
+
+    def test_multiple_ok_boxes_use_their_enclosing_rectangle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_image(root / "source.png", (100, 80))
+            target = root / "crop.png"
+            detections = [
+                Detection(3, "component_ok", 0.9, (-2.0, 5.0, 20.0, 30.0)),
+                Detection(3, "component_ok", 0.8, (60.0, 40.0, 105.0, 90.0)),
+            ]
+
+            box = save_yolo_ok_crop(
+                source, target, detections, ok_class_id=3, image_size=(100, 80)
+            )
+
+            self.assertEqual(box, (0, 5, 100, 80))
+            with Image.open(target) as crop:
+                self.assertEqual(crop.size, (100, 75))
+
+    def test_missing_ok_bbox_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_image(root / "source.png", (20, 20))
+            with self.assertRaisesRegex(ValueError, "no OK-class"):
+                save_yolo_ok_crop(
+                    source,
+                    root / "crop.png",
+                    [Detection(4, "ng", 0.9, (1.0, 1.0, 5.0, 5.0))],
+                    ok_class_id=3,
+                    image_size=(20, 20),
+                )
 
 
 if __name__ == "__main__":

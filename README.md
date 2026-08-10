@@ -431,6 +431,7 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 2. YOLO 閘門  套用 yolo_classify.py 的 OK/NG 規則與複判素材輸出
               NG -> <output-dir>/NG/<label>/ 後結束；OK -> 進入下一步
 3. 類別路由   anomaly_dino / patchcore：用訓練好的 HOAMV2 KNN index 判斷類別
+              anomaly_dino 會先裁切 YOLO OK bbox，HOAM 與異常模型皆使用該 crop
               dinomaly：跳過（單一模型涵蓋所有類別）
 4. 異常推論   以該類別對應的 anomalib checkpoint 推論
               -> <output-dir>/anomaly/[<class>/]<OK|NG>/
@@ -454,10 +455,10 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 │           └── image_result.png   # 原圖 | heat-map | pred mask
 ├── report.json               # 執行參數、統計、每張影像的完整軌跡
 ├── report.csv                # 同上，方便用 Excel 檢視
-└── _work/                    # 旋轉後的暫存影像與送入 anomalib 的 symlink
+└── _work/                    # 旋轉影像、anomaly_dino 的 YOLO crop 與 anomalib symlink
 ```
 
-`report.csv` 每列記錄一張影像走過的每一站：方向、是否旋轉、YOLO 判定與理由、
+`report.csv` 每列記錄一張影像走過的每一站：方向、是否旋轉、YOLO 判定、OK bbox/crop 與理由、
 HOAM 類別、使用的 checkpoint、anomaly score 與判定、以及所有輸出路徑。
 
 ### 安裝
