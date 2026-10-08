@@ -17,6 +17,9 @@ writes the cropped image below the output directory.
 Alternatively, ``--type-list`` reads one requested XML ``Component.Type``
 value per line. Component names for filename parsing are taken from the
 same-name XML, and only images belonging to a requested Type are cropped.
+Machine exports also support short ``{component}_{board}_{light}`` names.
+Their XML may have a different name: ``PicPath`` is matched using the full
+relative path beginning with ``MAP``, including date and board directory.
 """
 
 from __future__ import annotations
@@ -68,6 +71,15 @@ class FilenameInfo:
         return (first,) if first == second else (first, second)
 
 
+@dataclass(frozen=True)
+class XmlImageReference:
+    """An Image and its owning Component, found through XML PicPath."""
+
+    xml_path: Path
+    component: ET.Element
+    image_node: ET.Element
+
+
 @dataclass
 class Stats:
     """Counters describing one run."""
@@ -94,7 +106,7 @@ class Stats:
         )
 
     def has_errors(self) -> bool:
-        """Returns whether any selected image failed to produce a crop."""
+        """Returns whether XML lookup or a selected crop failed."""
         return any(
             (
                 self.missing_xml,
@@ -173,17 +185,20 @@ def parse_filename(
 ) -> FilenameInfo | None:
     """Parses a selected component from a filename stem.
 
-    The first four underscore-separated fields are fixed metadata fields.
+    Long names start with four underscore-separated metadata fields. Short
+    names contain just the component, board, and light.
     Component names are tested longest-first, which makes names containing
     underscores and names that prefix another requested component safe.
     """
     prefix = stem.split("_", 4)
     if len(prefix) != 5 or any(not value for value in prefix[:4]):
-        return None
+        return _parse_short_filename(stem, components, ignore_case)
     tail = prefix[4]
     compare_tail = tail.casefold() if ignore_case else tail
 
-    ordered = sorted(components.items(), key=lambda item: len(item[0]), reverse=True)
+    ordered = sorted(
+        components.items(), key=lambda item: len(item[0]), reverse=True
+    )
     for key, component in ordered:
         component_prefix = f"{key}_"
         if not compare_tail.startswith(component_prefix):
@@ -205,13 +220,36 @@ def parse_filename(
         if not separator or not board_2 or not light:
             continue
         return FilenameInfo(component, board_1, board_2, light)
+    return _parse_short_filename(stem, components, ignore_case)
+
+
+def _parse_short_filename(
+    stem: str,
+    components: dict[str, str],
+    ignore_case: bool,
+) -> FilenameInfo | None:
+    """Parses a requested component from a component/board/light name."""
+    compare = stem.casefold() if ignore_case else stem
+    ordered = sorted(
+        components.items(), key=lambda item: len(item[0]), reverse=True
+    )
+    for key, component in ordered:
+        if not compare.startswith(f"{key}_"):
+            continue
+        board, separator, light = stem[len(component) + 1:].partition("_")
+        if separator and board and light:
+            return FilenameInfo(component, board, board, light)
     return None
 
 
 def _looks_like_known_filename(stem: str) -> bool:
-    """Returns whether a stem has at least the four fixed prefix fields."""
+    """Returns whether a stem has long-name or short-name fields."""
     parts = stem.split("_", 4)
-    return len(parts) == 5 and all(parts[:4])
+    short_parts = stem.rsplit("_", 2)
+    return (
+        len(parts) == 5 and all(parts[:4])
+        or len(short_parts) == 3 and all(short_parts)
+    )
 
 
 def find_images(
@@ -221,14 +259,21 @@ def find_images(
     extensions: tuple[str, ...],
 ) -> list[Path]:
     """Finds images recursively while excluding XML and output directories."""
-    excluded = [xml_dir.resolve()]
     resolved_input = input_dir.resolve()
+    excluded = []
+    if xml_dir.resolve() != resolved_input:
+        excluded.append(xml_dir.resolve())
     resolved_output = output_dir.resolve()
     if resolved_output.is_relative_to(resolved_input):
         excluded.append(resolved_output)
     images: list[Path] = []
     for path in sorted(input_dir.rglob("*")):
         if not path.is_file() or path.suffix.casefold() not in extensions:
+            continue
+        if any(
+            part.casefold() == "xml"
+            for part in path.relative_to(input_dir).parts[:-1]
+        ):
             continue
         resolved = path.resolve()
         if any(resolved.is_relative_to(directory) for directory in excluded):
@@ -237,12 +282,91 @@ def find_images(
     return images
 
 
-def index_xml_files(xml_dir: Path) -> dict[str, list[Path]]:
+def index_xml_files(
+    xml_dir: Path,
+    output_dir: Path | None = None,
+) -> dict[str, list[Path]]:
     """Indexes XML files by case-insensitive filename stem."""
     index: dict[str, list[Path]] = {}
+    excluded = output_dir.resolve() if output_dir is not None else None
     for path in sorted(xml_dir.rglob("*")):
         if path.is_file() and path.suffix.casefold() == ".xml":
+            if excluded is not None and path.resolve().is_relative_to(excluded):
+                continue
             index.setdefault(path.stem.casefold(), []).append(path)
+    return index
+
+
+def _map_path_key(value: str) -> tuple[str, ...] | None:
+    """Normalizes a Windows/POSIX path from its last MAP directory."""
+    parts = [
+        part.casefold()
+        for part in value.strip().strip('"').replace("\\", "/").split("/")
+        if part not in ("", ".")
+    ]
+    anchors = [i for i, part in enumerate(parts) if part == "map"]
+    if not anchors:
+        return None
+    relative = parts[anchors[-1]:]
+    if ".." in relative:
+        return None
+    return tuple(relative)
+
+
+def index_map_images(
+    xml_index: dict[str, list[Path]],
+    images: list[Path],
+    stats: Stats,
+) -> dict[tuple[str, ...], list[XmlImageReference]]:
+    """Indexes XML PicPath references to scanned MAP images once per run.
+
+    References with identical CompName, Type, and bbox values are deduplicated
+    across XML files. Different regions remain separate crops.
+    """
+    image_keys = {
+        key for image in images
+        if (key := _map_path_key(str(image))) is not None
+    }
+    index: dict[tuple[str, ...], list[XmlImageReference]] = {}
+    if not image_keys:
+        return index
+    signatures: dict[tuple[str, ...], set[tuple[str | None, ...]]] = {}
+    for paths in xml_index.values():
+        for xml_path in paths:
+            try:
+                root = ET.parse(xml_path).getroot()
+            except (ET.ParseError, OSError) as error:
+                stats.xml_errors += 1
+                _LOGGER.warning("Cannot parse XML %s: %s", xml_path, error)
+                continue
+            for component in root.iter():
+                if _localname(component.tag).casefold() != "component":
+                    continue
+                for comp_image in component:
+                    if _localname(comp_image.tag).casefold() != "compimage":
+                        continue
+                    for image_node in comp_image.iter():
+                        if _localname(image_node.tag).casefold() != "image":
+                            continue
+                        pic_path = (
+                            _get_field(image_node, "PicPath")
+                            or _get_field(comp_image, "PicPath")
+                        )
+                        key = _map_path_key(pic_path) if pic_path else None
+                        if key is None or key not in image_keys:
+                            continue
+                        signature = (
+                            _get_field(component, "CompName"),
+                            _get_field(component, "Type"),
+                            *(_get_field(image_node, f) for f in _COORD_FIELDS),
+                        )
+                        seen = signatures.setdefault(key, set())
+                        if signature in seen:
+                            continue
+                        seen.add(signature)
+                        index.setdefault(key, []).append(
+                            XmlImageReference(xml_path, component, image_node)
+                        )
     return index
 
 
@@ -263,11 +387,17 @@ def _matching_xml(
     if source_relative.parts and source_relative.parts[0].casefold() == "ng":
         possible_parents.append(Path(*source_relative.parts[1:-1]))
 
-    for parent in possible_parents:
-        wanted = (xml_dir / parent / f"{source.stem}.xml").resolve()
-        exact = [path for path in xml_candidates if path.resolve() == wanted]
-        if len(exact) == 1:
-            return exact[0]
+    xml_roots = [xml_dir]
+    if xml_dir.resolve() == input_dir.resolve():
+        xml_roots.insert(0, xml_dir / "XML")
+    for xml_root in xml_roots:
+        for parent in possible_parents:
+            wanted = (xml_root / parent / f"{source.stem}.xml").resolve()
+            exact = [
+                path for path in xml_candidates if path.resolve() == wanted
+            ]
+            if len(exact) == 1:
+                return exact[0]
     return None
 
 
@@ -471,6 +601,7 @@ def process_image(
     used_outputs: set[Path],
     stats: Stats,
     requested_types: dict[str, str] | None = None,
+    map_index: dict[tuple[str, ...], list[XmlImageReference]] | None = None,
 ) -> None:
     """Selects and crops one source image, recording failures in stats."""
     stats.images_seen += 1
@@ -485,9 +616,42 @@ def process_image(
                 _LOGGER.warning("Unrecognized image filename: %s", source)
             return
         stats.selected += 1
-    elif not _looks_like_known_filename(source.stem):
-        stats.unparsed_names += 1
-        _LOGGER.warning("Unrecognized image filename: %s", source)
+
+    key = _map_path_key(str(source))
+    references = map_index.get(key, []) if map_index and key else []
+    if references:
+        if requested_types is not None:
+            references = [
+                ref for ref in references
+                if _type_is_requested(
+                    ref.component, requested_types, ignore_case
+                )
+            ]
+            if not references:
+                stats.not_requested += 1
+                return
+            stats.selected += 1
+        else:
+            references = [
+                ref for ref in references
+                if any(
+                    _matches(
+                        _get_field(ref.component, "CompName") or "",
+                        name,
+                        ignore_case,
+                    )
+                    for name in info.xml_component_names
+                )
+            ]
+            if not references:
+                stats.missing_component += 1
+                _LOGGER.warning("No matching XML Component for %s", source)
+                return
+        for ref in references:
+            crop_image(
+                source, input_dir, output_dir, ref.image_node, ref.xml_path,
+                on_exists, dry_run, used_outputs, stats,
+            )
         return
 
     xml_candidates = xml_index.get(source.stem.casefold(), [])
@@ -502,7 +666,10 @@ def process_image(
             )
         else:
             stats.missing_xml += 1
-            _LOGGER.warning("No same-name XML found for %s", source)
+            _LOGGER.warning(
+                "No same-name XML or matching MAP PicPath found for %s",
+                source,
+            )
         return
 
     try:
@@ -553,6 +720,24 @@ def process_image(
     if requested_types is not None:
         stats.selected += 1
 
+    crop_image(
+        source, input_dir, output_dir, image_node, xml_path,
+        on_exists, dry_run, used_outputs, stats,
+    )
+
+
+def crop_image(
+    source: Path,
+    input_dir: Path,
+    output_dir: Path,
+    image_node: ET.Element,
+    xml_path: Path,
+    on_exists: str,
+    dry_run: bool,
+    used_outputs: set[Path],
+    stats: Stats,
+) -> None:
+    """Writes a selected XML region, preserving source-relative paths."""
     try:
         with Image.open(source) as image:
             image.load()
@@ -594,7 +779,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Crop components selected by name or XML Type from AOI images, "
-            "using a text list and same-name XML files for bbox coordinates."
+            "using a text list and XML PicPath or same-name XML for bbox "
+            "coordinates."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -603,7 +789,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--input-dir",
         required=True,
         type=Path,
-        help="Root containing XML/, NG/, and/or image files.",
+        help="Root containing XML/, MAP/, NG/, and/or nested machine exports.",
     )
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument(
@@ -629,7 +815,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-x",
         "--xml-dir",
         type=Path,
-        help="XML directory; defaults to <input-dir>/XML.",
+        help="XML search root; defaults to recursively searching input-dir.",
     )
     parser.add_argument(
         "--ext",
@@ -683,7 +869,7 @@ def main(argv: list[str] | None = None) -> int:
     xml_dir = (
         args.xml_dir.resolve()
         if args.xml_dir is not None
-        else input_dir / "XML"
+        else input_dir
     )
     output_dir = args.output_dir.resolve()
 
@@ -727,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
         for extension in args.ext
     )
     images = find_images(input_dir, xml_dir, output_dir, extensions)
-    xml_index = index_xml_files(xml_dir)
+    xml_index = index_xml_files(xml_dir, output_dir)
     _LOGGER.info(
         "Loaded %d requested %s value(s), found %d image(s) "
         "and %d XML file(s)",
@@ -738,6 +924,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     stats = Stats()
+    map_index = index_map_images(xml_index, images, stats)
     used_outputs: set[Path] = set()
     for source in images:
         process_image(
@@ -757,6 +944,7 @@ def main(argv: list[str] | None = None) -> int:
             requested_types=(
                 requested_values if args.type_list is not None else None
             ),
+            map_index=map_index,
         )
 
     _LOGGER.info(

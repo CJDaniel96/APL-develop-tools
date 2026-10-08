@@ -247,17 +247,19 @@ INFO Done. Summary:
 
 ## crop_components.py
 
-輸入根目錄預期含有 `XML` 資料夾，以及根目錄或 `NG` 等子目錄內的影像。
+輸入根目錄可包含 `XML`、`MAP`、`NG` 資料夾，或多個內層的機台匯出目錄。
 可用 `--component-list` 依 Component Name 篩選，或用 `--type-list` 依 XML
 `Component` 的 `Type` 篩選，兩者必須擇一。清單是 UTF-8 txt 檔，每行一個值
-（支援 BOM，空白行與重複值會忽略）。影像檔名規則：
+（支援 BOM，空白行與重複值會忽略）。支援兩種影像檔名：
 
 ```
 {數字代號}_{時間戳}_{日期}_{機台編號}_{component}_{小板號}_{component}_{小板號}_{光源}.jpg
+{component}_{小板號}_{光源}.jpg
 ```
 
 Component Name 模式會用清單中的名稱解析檔名，因此名稱本身可以含底線。符合清單的影像
-會依檔名 stem 尋找 `XML` 目錄下的同名 `.xml`，再從以下階層尋找資料：
+會透過 XML `PicPath` 對應 `MAP` 影像，或依檔名 stem 尋找同名 `.xml`，
+再從以下階層尋找資料：
 
 ```
 Panel > Board > Component[CompName="{component}_{小板號}"]
@@ -276,7 +278,7 @@ uv run scripts/crop_components.py \
     --output-dir ./CROPPED
 ```
 
-預設 XML 目錄是 `<input-dir>/XML`；也可以另外指定：
+預設會遞迴搜尋輸入目錄內的 XML（包含內層 `T1Post_XML/XML`）；也可以另外指定：
 
 ```bash
 uv run scripts/crop_components.py -i ./DATA -c ./components.txt \
@@ -303,13 +305,32 @@ uv run scripts/crop_components.py -i ./DATA -c ./components.txt \
 uv run scripts/crop_components.py -i ./DATA --type-list ./types.txt -o ./CROPPED
 ```
 
-Type 模式會先讀取同名 XML，用 `CompName` 解析影像的元件與小板號，再找出該影像
-所屬的 `Component`。只有**該 Component 的 Type** 在清單中才會裁切；同一份 XML
-內其他元件的 Type 符合，不會使這張影像被選入。Type 不在清單中或缺少時會跳過，
+Type 模式會先讀取 XML，再找出影像所屬的 `Component`：`MAP` 資料透過
+XML `Image.PicPath`（或 `CompImage.PicPath`）對應，其他資料使用同名 XML
+與 `CompName`。只有**對應影像之 Component 的 Type** 在清單中才會裁切；
+同一份 XML 內其他影像的 Type 符合，不會使這張影像被選入。Type 不在清單中或缺少時會跳過，
 計入 `not_requested`。Type 可寫成 XML attribute 或直接子元素，欄位名稱比對
 忽略大小寫與 namespace；值預設精確比對，加上 `--ignore-case` 可忽略值的大小寫。
 
 輸出仍保留來源相對路徑。可搭配 `--dry-run` 先驗證，不建立輸出資料夾。
+
+### 機台 MAP 資料與短檔名
+
+例如 `MAP/20261001/T1/7043-120095-01B/20261001 235938T1/L25_1_SolderLight.jpg`，
+可直接使用 `--type-list`，不需要加上時間等前綴或重新命名 XML：
+
+```powershell
+uv run scripts/crop_components.py -i ./data/1001/T1Post_XML -t ./types.txt -o ./CROPPED --dry-run
+```
+
+也可以把 `-i` 指向包含多份匯出資料的上層目錄。移除 `--dry-run` 即可實際裁切。
+程式會忽略 XML `PicPath` 中機台的磁碟與根目錄前綴，從最後一個 `MAP` 目錄開始
+比對完整相對路徑，包含日期、站別、產品與板子目錄。路徑中的空白、Windows 分隔符
+與大小寫差異均可處理，不會只憑檔名把不同板子的影像混在一起。
+
+同一影像在多份 XML 中出現相同 `CompName`、`Type` 與 bbox 時只裁切一次；
+不同 bbox 會分別輸出，後續檔名加上 `_1`、`_2` 等尾碼。`selected` 計算選入的影像數，
+`written` 計算裁切輸出數，因此一張影像有多個區域時 `written` 可大於 `selected`。
 
 ### 參數
 
@@ -319,7 +340,7 @@ Type 模式會先讀取同名 XML，用 `CompName` 解析影像的元件與小�
 | `-c`, `--component-list` | 與 `--type-list` 擇一 | UTF-8 txt，每行一個 Component Name |
 | `-t`, `--type-list` | 與 `--component-list` 擇一 | UTF-8 txt，每行一個 XML `Component.Type` 值 |
 | `-o`, `--output-dir` | （必填） | 裁切結果目錄，保留來源相對路徑 |
-| `-x`, `--xml-dir` | `<input-dir>/XML` | XML 搜尋目錄 |
+| `-x`, `--xml-dir` | `<input-dir>` | XML 搜尋根目錄，遞迴搜尋，排除輸出目錄 |
 | `--ext` | 常見影像格式 | 要掃描的影像副檔名 |
 | `--ignore-case` | 關閉 | Component Name、XML `CompName` 與 `Type` 值忽略大小寫 |
 | `--on-exists` | `suffix` | 已存在時：`suffix` / `skip` / `overwrite` |
@@ -327,7 +348,7 @@ Type 模式會先讀取同名 XML，用 `CompName` 解析影像的元件與小�
 | `-v`, `--verbose` | 關閉 | DEBUG 等級日誌 |
 | `-q`, `--quiet` | 關閉 | 只輸出 warning 與 error |
 
-如果同一個 Component 下有多個 `Image`，程式會優先比對 `PicPath`、`FileName`
+使用同名 XML 時，如果同一個 Component 下有多個 `Image`，程式會優先比對 `PicPath`、`FileName`
 等欄位中的影像檔名，其次比對光源欄位；仍無法唯一判定時會跳過，避免使用錯誤 bbox。
 任一已選影像因缺 XML、缺 Component、bbox 無效或讀寫失敗時，整批仍會繼續，最後
 回傳離開碼 `1`；輸入路徑／清單無效時為 `2`，全部成功時為 `0`。
