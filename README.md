@@ -116,7 +116,7 @@ uv run scripts/crop_images.py -x ./XML -i ./IMG -o ./BY_TYPE \
 Pad ID 優先讀取 `Image` 的 `PadID`，其次讀取 `CompImage`、`Component`。
 光源依相同層級順序讀取 `Light` 或 `LightSource`；欄位名稱忽略大小寫與 namespace。
 若沒有這些欄位，才從來源檔名 `{Component Name}_{Pad ID}_{光源}` 取得，支援
-`SolderLight`、`UniformLight`（忽略大小寫）及光源後的數字後綴。
+`SolderLight`、`UniformLight`、`LowAngleLight`（忽略大小寫）及光源後的數字後綴。
 
 Component Name 預設使用 XML `CompName`。只有來源檔名能確認
 `CompName == {Component Name}_{Pad ID}` 時，才去除末尾的 Pad ID，避免重複。

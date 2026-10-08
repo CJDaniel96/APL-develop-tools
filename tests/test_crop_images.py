@@ -182,7 +182,7 @@ class CropImagesTest(unittest.TestCase):
     def test_xml_pad_and_light_override_filename(self) -> None:
         self.add_image(
             filename="IC_TOP_3_UniformLight_2.png",
-            image_fields={"PadID": "7", "LightSource": "solderlight"},
+            image_fields={"PadID": "7", "LightSource": "lowanglelight"},
             comp_image_fields={"PadID": "8", "Light": "UniformLight"},
         )
         output = self.root / "OUT"
@@ -191,18 +191,29 @@ class CropImagesTest(unittest.TestCase):
             "--filename-format", "package-component",
         ), 0)
         self.assertTrue((
-            output / "32-350177-01/IC_IC_TOP_7_SolderLight.jpg"
+            output / "32-350177-01/IC_IC_TOP_7_LowAngleLight.jpg"
         ).is_file())
 
     def test_filename_suffix_and_component_underscores(self) -> None:
-        self.add_image(filename="IC_TOP_3_UniformLight_2.png")
+        lights = ("SolderLight", "UniformLight", "LowAngleLight")
+        for light in lights:
+            self.add_image(filename=f"IC_TOP_3_{light.lower()}_2.png")
         output = self.root / "OUT"
+        manifest = output / "manifest.csv"
         self.assertEqual(self.run_cli(
             output, "--filename-format", "package-component",
+            "--manifest", str(manifest),
         ), 0)
-        self.assertTrue((output / (
-            "MAP/20261008/T1/Product/BoardA/IC_IC_TOP_3_UniformLight.jpg"
-        )).is_file())
+        for light in lights:
+            with self.subTest(light=light):
+                self.assertTrue((output / (
+                    f"MAP/20261008/T1/Product/BoardA/IC_IC_TOP_3_{light}.jpg"
+                )).is_file())
+        rows = self.manifest_rows(manifest)
+        self.assertEqual([row["Light"] for row in rows], list(lights))
+        self.assertTrue(all(row["ComponentName"] == "IC_TOP" for row in rows))
+        self.assertTrue(all(row["PadID"] == "3" for row in rows))
+        self.assertTrue(all(row["missing_fields"] == "" for row in rows))
 
     def test_unconfirmed_compname_suffix_is_preserved(self) -> None:
         self.add_image(component_fields={

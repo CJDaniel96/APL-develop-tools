@@ -65,7 +65,10 @@ _FILENAME_FORMATS = {
     "package-component": ("PackageType", "ComponentName", "PadID", "Light"),
     "type-component": ("Type", "ComponentName", "PadID", "Light"),
 }
-_LIGHTS = {name.lower(): name for name in ("SolderLight", "UniformLight")}
+_LIGHTS = {
+    name.lower(): name
+    for name in ("SolderLight", "UniformLight", "LowAngleLight")
+}
 _MANIFEST_FIELDS = (
     "xml_path", "source_path", "source_relative", "output_path",
     "CompName", "Type", "PackageType", "ComponentName", "PadID", "Light",
