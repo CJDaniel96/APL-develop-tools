@@ -17,7 +17,8 @@ AOI（自動光學檢測）開發用的工具集合。目前包含六支 CLI：
 - [uv](https://docs.astral.sh/uv/)
 - Pillow >= 12.3.0（由 uv 自動安裝）
 - Ultralytics >= 8.3.0（由 uv 自動安裝）
-- `e2e_infer.py` 另外需要 `e2e` extra（anomalib、torch、faiss-cpu 等）
+- PyTorch 與 torchvision（由 uv 自動安裝；Windows x64 使用 CUDA 13.0 版）
+- `e2e_infer.py` 另外需要 `e2e` extra（anomalib、faiss-cpu 等）
 
 ## 安裝
 
@@ -30,6 +31,31 @@ uv sync
 ```bash
 uv sync --extra e2e
 ```
+
+### Windows CUDA
+
+Windows x64 執行上述 `uv sync` 或 `uv sync --extra e2e` 時，會自動從
+[PyTorch 官方 CUDA 13.0 套件來源](https://download.pytorch.org/whl/cu130)
+安裝配對的 `torch` 與 `torchvision`，不需要另用 pip 安裝。macOS 與 Linux
+使用原本的 PyPI 套件來源。
+
+CUDA 推論需要 Turing（例如 RTX 20 系列）或更新架構的 NVIDIA GPU，
+以及 R580 或更新的 NVIDIA 驅動程式，詳見
+[CUDA 13.0 發行說明](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/)。
+一般執行預編譯 PyTorch 套件不需要另外安裝 CUDA Toolkit。
+
+在 Windows PowerShell 確認安裝與 GPU 可用性：
+
+```powershell
+uv run python -c "import torch; print('torch:', torch.__version__); print('CUDA:', torch.version.cuda); print('GPU available:', torch.cuda.is_available())"
+```
+
+`torch` 版本應帶有 `+cu130`，`CUDA` 應顯示 `13.0`；`GPU available: True`
+代表可使用 CUDA。若為 `False`，請先用 `nvidia-smi` 確認 GPU 與驅動程式，
+並檢查 GPU 是否受此 CUDA 版本支援。YOLO 推論可加上 `--device 0` 使用第一張 GPU。
+
+參考：[uv 的 PyTorch 設定方式](https://docs.astral.sh/uv/guides/integration/pytorch/)
+與 [PyTorch 官方版本配對](https://pytorch.org/get-started/previous-versions/)。
 
 ## crop_images.py
 
