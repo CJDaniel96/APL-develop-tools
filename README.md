@@ -5,7 +5,7 @@ AOI（自動光學檢測）開發用的工具集合。目前包含六支 CLI：
 | 工具 | 說明 |
 | --- | --- |
 | [`scripts/crop_images.py`](scripts/crop_images.py) | 依 AOI XML 批次裁切，可按元件欄位分組、重新命名及輸出來源對照表 |
-| [`scripts/crop_components.py`](scripts/crop_components.py) | 依元件清單篩選影像，從同名 XML 讀取 bbox 並裁切元件 |
+| [`scripts/crop_components.py`](scripts/crop_components.py) | 依 Component Name 或 Type 清單篩選影像，從同名 XML 讀取 bbox 並裁切元件 |
 | [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
 | [`scripts/rotate_images.py`](scripts/rotate_images.py) | 依 pixel size 判斷方向，將影像統一旋轉為橫向或豎向 |
 | [`scripts/yolo_classify.py`](scripts/yolo_classify.py) | 使用 Ultralytics YOLO 推論，依 bbox 與 label 規則分類保存到 OK/NG |
@@ -247,14 +247,16 @@ INFO Done. Summary:
 
 ## crop_components.py
 
-輸入根目錄預期含有 `XML` 資料夾，以及根目錄或 `NG` 等子目錄內的影像。元件清單
-是 UTF-8 txt 檔，每行一個 Component Name（空白行會忽略）。影像檔名規則：
+輸入根目錄預期含有 `XML` 資料夾，以及根目錄或 `NG` 等子目錄內的影像。
+可用 `--component-list` 依 Component Name 篩選，或用 `--type-list` 依 XML
+`Component` 的 `Type` 篩選，兩者必須擇一。清單是 UTF-8 txt 檔，每行一個值
+（支援 BOM，空白行與重複值會忽略）。影像檔名規則：
 
 ```
 {數字代號}_{時間戳}_{日期}_{機台編號}_{component}_{小板號}_{component}_{小板號}_{光源}.jpg
 ```
 
-程式會用清單中的名稱解析檔名，因此 Component Name 本身可以含底線。符合清單的影像
+Component Name 模式會用清單中的名稱解析檔名，因此名稱本身可以含底線。符合清單的影像
 會依檔名 stem 尋找 `XML` 目錄下的同名 `.xml`，再從以下階層尋找資料：
 
 ```
@@ -288,16 +290,38 @@ uv run scripts/crop_components.py -i ./DATA -c ./components.txt \
     -o ./CROPPED --dry-run
 ```
 
+### 依 Type 清單篩選
+
+例如 `types.txt` 每行放一個 XML `Component.Type` 值：
+
+```text
+32-350177-01
+32-350178-01
+```
+
+```bash
+uv run scripts/crop_components.py -i ./DATA --type-list ./types.txt -o ./CROPPED
+```
+
+Type 模式會先讀取同名 XML，用 `CompName` 解析影像的元件與小板號，再找出該影像
+所屬的 `Component`。只有**該 Component 的 Type** 在清單中才會裁切；同一份 XML
+內其他元件的 Type 符合，不會使這張影像被選入。Type 不在清單中或缺少時會跳過，
+計入 `not_requested`。Type 可寫成 XML attribute 或直接子元素，欄位名稱比對
+忽略大小寫與 namespace；值預設精確比對，加上 `--ignore-case` 可忽略值的大小寫。
+
+輸出仍保留來源相對路徑。可搭配 `--dry-run` 先驗證，不建立輸出資料夾。
+
 ### 參數
 
 | 參數 | 預設 | 說明 |
 | --- | --- | --- |
 | `-i`, `--input-dir` | （必填） | 影像與 `XML` 所在的輸入根目錄 |
-| `-c`, `--component-list` | （必填） | UTF-8 txt，每行一個 Component Name |
+| `-c`, `--component-list` | 與 `--type-list` 擇一 | UTF-8 txt，每行一個 Component Name |
+| `-t`, `--type-list` | 與 `--component-list` 擇一 | UTF-8 txt，每行一個 XML `Component.Type` 值 |
 | `-o`, `--output-dir` | （必填） | 裁切結果目錄，保留來源相對路徑 |
 | `-x`, `--xml-dir` | `<input-dir>/XML` | XML 搜尋目錄 |
 | `--ext` | 常見影像格式 | 要掃描的影像副檔名 |
-| `--ignore-case` | 關閉 | Component Name 與 XML `CompName` 忽略大小寫 |
+| `--ignore-case` | 關閉 | Component Name、XML `CompName` 與 `Type` 值忽略大小寫 |
 | `--on-exists` | `suffix` | 已存在時：`suffix` / `skip` / `overwrite` |
 | `--dry-run` | 關閉 | 只驗證與回報，不寫檔 |
 | `-v`, `--verbose` | 關閉 | DEBUG 等級日誌 |
@@ -307,6 +331,8 @@ uv run scripts/crop_components.py -i ./DATA -c ./components.txt \
 等欄位中的影像檔名，其次比對光源欄位；仍無法唯一判定時會跳過，避免使用錯誤 bbox。
 任一已選影像因缺 XML、缺 Component、bbox 無效或讀寫失敗時，整批仍會繼續，最後
 回傳離開碼 `1`；輸入路徑／清單無效時為 `2`，全部成功時為 `0`。
+Type 模式必須先讀取 XML 才能決定是否選入，因此無法找到或解析 XML、
+無法辨識影像所屬 Component 或 Image 節點時也會回報錯誤並回傳 `1`。
 
 ## group_images.py
 

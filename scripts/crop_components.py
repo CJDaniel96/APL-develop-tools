@@ -13,6 +13,10 @@ For a selected image, an XML file with the same stem is located below the XML
 directory. The script finds the ``Component`` whose ``CompName`` is
 ``{component}_{board}``, reads X1/Y1/X2/Y2 from its ``Image`` element, and
 writes the cropped image below the output directory.
+
+Alternatively, ``--type-list`` reads one requested XML ``Component.Type``
+value per line. Component names for filename parsing are taken from the
+same-name XML, and only images belonging to a requested Type are cropped.
 """
 
 from __future__ import annotations
@@ -123,24 +127,43 @@ def _get_field(element: ET.Element, name: str) -> str | None:
     return None
 
 
-def load_components(path: Path, ignore_case: bool) -> dict[str, str]:
-    """Loads non-empty component names, preserving their first spelling."""
+def load_requested_values(path: Path, ignore_case: bool) -> dict[str, str]:
+    """Loads non-empty list values, preserving their first spelling."""
     lookup: dict[str, str] = {}
-    with path.open("r", encoding="utf-8-sig") as component_file:
-        for line_number, line in enumerate(component_file, start=1):
-            component = line.strip()
-            if not component:
+    with path.open("r", encoding="utf-8-sig") as list_file:
+        for line_number, line in enumerate(list_file, start=1):
+            value = line.strip()
+            if not value:
                 continue
-            key = component.casefold() if ignore_case else component
+            key = value.casefold() if ignore_case else value
             if key in lookup:
                 _LOGGER.debug(
-                    "Ignoring duplicate component on line %d: %s",
+                    "Ignoring duplicate value on line %d: %s",
                     line_number,
-                    component,
+                    value,
                 )
                 continue
-            lookup[key] = component
+            lookup[key] = value
     return lookup
+
+
+def _xml_component_names(
+    root: ET.Element,
+    ignore_case: bool,
+) -> dict[str, str]:
+    """Extracts filename component names from XML CompName values."""
+    components: dict[str, str] = {}
+    for element in root.iter():
+        if _localname(element.tag).casefold() != "component":
+            continue
+        comp_name = _get_field(element, "CompName")
+        if comp_name is None:
+            continue
+        name, separator, board = comp_name.rpartition("_")
+        if separator and name and board:
+            key = name.casefold() if ignore_case else name
+            components.setdefault(key, name)
+    return components
 
 
 def parse_filename(
@@ -274,24 +297,41 @@ def _value_matches_source(value: str, source: Path) -> bool:
     )
 
 
+def _type_is_requested(
+    component: ET.Element,
+    requested_types: dict[str, str],
+    ignore_case: bool,
+) -> bool:
+    """Checks a Component's own Type against the requested values."""
+    value = _get_field(component, "Type")
+    if value is None:
+        return False
+    key = value.casefold() if ignore_case else value
+    return key in requested_types
+
+
 def find_image_node(
     root: ET.Element,
     source: Path,
     info: FilenameInfo,
     ignore_case: bool,
+    requested_types: dict[str, str] | None = None,
 ) -> tuple[ET.Element | None, str]:
     """Finds the Image node for the requested Component.
 
     Exact source filename metadata is preferred. If that is absent, light
     metadata/text is used. A single remaining Image node is unambiguous.
+    An optional Type filter applies to the selected Image's own Component.
 
     Returns:
         ``(node, reason)``. ``node`` is None when no component exists or when
-        multiple Image nodes cannot safely be distinguished.
+        multiple Image nodes cannot safely be distinguished. A selected
+        Component with an unlisted or missing Type returns "not_requested".
     """
     wanted_names = info.xml_component_names
-    candidates: list[tuple[ET.Element, ET.Element]] = []
+    candidates: list[tuple[ET.Element, ET.Element, ET.Element]] = []
     component_found = False
+    requested_component_found = False
 
     for component in root.iter():
         if _localname(component.tag).casefold() != "component":
@@ -302,6 +342,10 @@ def find_image_node(
         ):
             continue
         component_found = True
+        if requested_types is None or _type_is_requested(
+            component, requested_types, ignore_case
+        ):
+            requested_component_found = True
 
         for comp_image in component:
             if _localname(comp_image.tag).casefold() != "compimage":
@@ -310,16 +354,18 @@ def find_image_node(
                 if image_node is comp_image:
                     continue
                 if _localname(image_node.tag).casefold() == "image":
-                    candidates.append((comp_image, image_node))
+                    candidates.append((component, comp_image, image_node))
 
     if not component_found:
         return None, "missing_component"
+    if not requested_component_found:
+        return None, "not_requested"
     if not candidates:
         return None, "missing_component"
 
     filename_matches = [
-        image_node
-        for comp_image, image_node in candidates
+        (component, comp_image, image_node)
+        for component, comp_image, image_node in candidates
         if any(
             _value_matches_source(value, source)
             for value in (
@@ -328,28 +374,36 @@ def find_image_node(
             )
         )
     ]
-    if len(filename_matches) == 1:
-        return filename_matches[0], "ok"
     if len(filename_matches) > 1:
         return None, "ambiguous_image_node"
-
-    light_matches = [
-        image_node
-        for comp_image, image_node in candidates
-        if any(
-            info.light.casefold() == value.casefold()
-            or f"_{info.light.casefold()}_" in f"_{value.casefold()}_"
-            for value in (
-                *comp_image.attrib.values(),
-                *image_node.attrib.values(),
+    if filename_matches:
+        selected = filename_matches[0]
+    else:
+        light_matches = [
+            (component, comp_image, image_node)
+            for component, comp_image, image_node in candidates
+            if any(
+                info.light.casefold() == value.casefold()
+                or f"_{info.light.casefold()}_" in f"_{value.casefold()}_"
+                for value in (
+                    *comp_image.attrib.values(),
+                    *image_node.attrib.values(),
+                )
             )
-        )
-    ]
-    if len(light_matches) == 1:
-        return light_matches[0], "ok"
-    if len(candidates) == 1:
-        return candidates[0][1], "ok"
-    return None, "ambiguous_image_node"
+        ]
+        if len(light_matches) == 1:
+            selected = light_matches[0]
+        elif len(candidates) == 1:
+            selected = candidates[0]
+        else:
+            return None, "ambiguous_image_node"
+
+    component, _, image_node = selected
+    if requested_types is not None and not _type_is_requested(
+        component, requested_types, ignore_case
+    ):
+        return None, "not_requested"
+    return image_node, "ok"
 
 
 def region_box(
@@ -416,18 +470,25 @@ def process_image(
     dry_run: bool,
     used_outputs: set[Path],
     stats: Stats,
+    requested_types: dict[str, str] | None = None,
 ) -> None:
     """Selects and crops one source image, recording failures in stats."""
     stats.images_seen += 1
-    info = parse_filename(source.stem, components, ignore_case)
-    if info is None:
-        if _looks_like_known_filename(source.stem):
-            stats.not_requested += 1
-        else:
-            stats.unparsed_names += 1
-            _LOGGER.warning("Unrecognized image filename: %s", source)
+    info = None
+    if requested_types is None:
+        info = parse_filename(source.stem, components, ignore_case)
+        if info is None:
+            if _looks_like_known_filename(source.stem):
+                stats.not_requested += 1
+            else:
+                stats.unparsed_names += 1
+                _LOGGER.warning("Unrecognized image filename: %s", source)
+            return
+        stats.selected += 1
+    elif not _looks_like_known_filename(source.stem):
+        stats.unparsed_names += 1
+        _LOGGER.warning("Unrecognized image filename: %s", source)
         return
-    stats.selected += 1
 
     xml_candidates = xml_index.get(source.stem.casefold(), [])
     xml_path = _matching_xml(source, input_dir, xml_candidates, xml_dir)
@@ -451,9 +512,25 @@ def process_image(
         _LOGGER.warning("Cannot parse XML %s: %s", xml_path, error)
         return
 
+    if requested_types is not None:
+        info = parse_filename(
+            source.stem, _xml_component_names(root, ignore_case), ignore_case
+        )
+        if info is None:
+            stats.missing_component += 1
+            _LOGGER.warning(
+                "No XML CompName identifies image %s in %s",
+                source.name,
+                xml_path,
+            )
+            return
+
     image_node, reason = find_image_node(
-        root, source, info, ignore_case
+        root, source, info, ignore_case, requested_types
     )
+    if reason == "not_requested":
+        stats.not_requested += 1
+        return
     if image_node is None:
         if reason == "ambiguous_image_node":
             stats.ambiguous_image_node += 1
@@ -472,6 +549,9 @@ def process_image(
                 xml_path,
             )
         return
+
+    if requested_types is not None:
+        stats.selected += 1
 
     try:
         with Image.open(source) as image:
@@ -513,8 +593,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parses command-line arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Crop components listed in a text file from AOI images, using "
-            "same-name XML files for bbox coordinates."
+            "Crop components selected by name or XML Type from AOI images, "
+            "using a text list and same-name XML files for bbox coordinates."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -525,12 +605,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Root containing XML/, NG/, and/or image files.",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
         "-c",
         "--component-list",
-        required=True,
         type=Path,
         help="UTF-8 text file containing one component name per line.",
+    )
+    selection.add_argument(
+        "-t",
+        "--type-list",
+        type=Path,
+        help="UTF-8 text file containing one XML Component Type per line.",
     )
     parser.add_argument(
         "-o",
@@ -555,7 +641,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ignore-case",
         action="store_true",
-        help="Match component and CompName values case-insensitively.",
+        help="Match component, CompName, and Type values case-insensitively.",
     )
     parser.add_argument(
         "--on-exists",
@@ -610,25 +696,28 @@ def main(argv: list[str] | None = None) -> int:
     if output_dir == input_dir:
         _LOGGER.error("Output directory must differ from input directory")
         return 2
-    if not args.component_list.is_file():
+    list_path = args.component_list or args.type_list
+    list_label = "Type" if args.type_list is not None else "Component"
+    if not list_path.is_file():
         _LOGGER.error(
-            "Component list does not exist: %s", args.component_list
+            "%s list does not exist: %s", list_label, list_path
         )
         return 2
 
     try:
-        components = load_components(
-            args.component_list, args.ignore_case
+        requested_values = load_requested_values(
+            list_path, args.ignore_case
         )
     except (OSError, UnicodeError) as error:
         _LOGGER.error(
-            "Cannot read component list %s: %s",
-            args.component_list,
+            "Cannot read %s list %s: %s",
+            list_label,
+            list_path,
             error,
         )
         return 2
-    if not components:
-        _LOGGER.error("Component list contains no non-empty names")
+    if not requested_values:
+        _LOGGER.error("%s list contains no non-empty values", list_label)
         return 2
 
     extensions = tuple(
@@ -640,8 +729,10 @@ def main(argv: list[str] | None = None) -> int:
     images = find_images(input_dir, xml_dir, output_dir, extensions)
     xml_index = index_xml_files(xml_dir)
     _LOGGER.info(
-        "Loaded %d component(s), found %d image(s) and %d XML file(s)",
-        len(components),
+        "Loaded %d requested %s value(s), found %d image(s) "
+        "and %d XML file(s)",
+        len(requested_values),
+        list_label,
         len(images),
         sum(len(paths) for paths in xml_index.values()),
     )
@@ -654,13 +745,18 @@ def main(argv: list[str] | None = None) -> int:
             input_dir=input_dir,
             xml_dir=xml_dir,
             output_dir=output_dir,
-            components=components,
+            components=(
+                requested_values if args.component_list is not None else {}
+            ),
             xml_index=xml_index,
             ignore_case=args.ignore_case,
             on_exists=args.on_exists,
             dry_run=args.dry_run,
             used_outputs=used_outputs,
             stats=stats,
+            requested_types=(
+                requested_values if args.type_list is not None else None
+            ),
         )
 
     _LOGGER.info(
