@@ -4,7 +4,7 @@ AOI（自動光學檢測）開發用的工具集合。目前包含六支 CLI：
 
 | 工具 | 說明 |
 | --- | --- |
-| [`scripts/crop_images.py`](scripts/crop_images.py) | 依 AOI 機台輸出的 XML 所標記的區域，批次裁切原始影像 |
+| [`scripts/crop_images.py`](scripts/crop_images.py) | 依 AOI XML 批次裁切，可按元件欄位分組、重新命名及輸出來源對照表 |
 | [`scripts/crop_components.py`](scripts/crop_components.py) | 依元件清單篩選影像，從同名 XML 讀取 bbox 並裁切元件 |
 | [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
 | [`scripts/rotate_images.py`](scripts/rotate_images.py) | 依 pixel size 判斷方向，將影像統一旋轉為橫向或豎向 |
@@ -49,7 +49,8 @@ uv sync --extra e2e
    `BoardID` 允許含有空白。
 2. 從 `<image-dir>/<相對路徑>` 讀取來源影像。
 3. 裁切 `(X1, Y1, X2, Y2)` 區域。
-4. 寫到 `<output-dir>/<相同的相對路徑>`，保留原本的目錄結構。
+4. 依所選的資料夾結構與命名格式保存；預設寫到
+   `<output-dir>/<相同的相對路徑>`，保留原本的目錄結構與檔名。
 
 ### 基本用法
 
@@ -72,12 +73,107 @@ uv run scripts/crop_images.py -x ./XML -i ./IMG -o ./OUT --dry-run
 | --- | --- | --- |
 | `-x`, `--xml-dir` | （必填） | 遞迴搜尋 `*.xml` 的目錄 |
 | `-i`, `--image-dir` | （必填） | 來源影像根目錄（內含 `MAP\...` 樹狀結構） |
-| `-o`, `--output-dir` | （必填） | 輸出根目錄，會鏡射 `MAP\...` 結構 |
+| `-o`, `--output-dir` | （必填） | 輸出根目錄，須與來源影像根目錄不同 |
+| `--output-layout` | `source` | 資料夾結構，見下表 |
+| `--filename-format` | `original` | 原檔名或三種 JPEG 命名格式，見下表 |
+| `--manifest CSV` | 無 | 選用的 `.csv` 來源對照表，僅記錄本次成功寫出的影像 |
 | `--anchor` | `MAP` | 用來還原 `PicPath` 的路徑片段 |
 | `--on-exists` | `suffix` | 輸出檔已存在時的處理方式：`suffix` / `skip` / `overwrite` |
 | `--dry-run` | 關閉 | 只回報會裁切什麼，不寫檔 |
 | `-v`, `--verbose` | 關閉 | DEBUG 等級日誌 |
 | `-q`, `--quiet` | 關閉 | 只輸出 warning 與 error |
+
+### 按 XML 元件欄位分組
+
+資料夾結構與檔名格式是**獨立選項**，可以任意搭配。`CompName`、`Type`、
+`PackageType` 取自每個 `Image` 所屬的最近一層 `Component`，保留 XML 原始值。
+例如 `CompName="U5009_1"`、`Type="32-350177-01"`、`PackageType="IC"`：
+
+| `--output-layout` | 輸出結構（相對於 output-dir） |
+| --- | --- |
+| `source` | 原始 `MAP/.../影像` 路徑 |
+| `comp-name` | `U5009_1/影像` |
+| `type` | `32-350177-01/影像` |
+| `package-type` | `IC/影像` |
+| `comp-type-package` | `U5009_1/32-350177-01/IC/影像` |
+
+例如按 `Type` 分組，但保留原檔名：
+
+```bash
+uv run scripts/crop_images.py -x ./XML -i ./IMG -o ./BY_TYPE \
+    --output-layout type
+```
+
+### 重新命名影像
+
+| `--filename-format` | 檔名格式 |
+| --- | --- |
+| `original` | 保留來源檔名與副檔名 |
+| `type-package-component` | `{Type}_{PackageType}_{Component Name}_{Pad ID}_{光源}.jpg` |
+| `package-component` | `{PackageType}_{Component Name}_{Pad ID}_{光源}.jpg` |
+| `type-component` | `{Type}_{Component Name}_{Pad ID}_{光源}.jpg` |
+
+Pad ID 優先讀取 `Image` 的 `PadID`，其次讀取 `CompImage`、`Component`。
+光源依相同層級順序讀取 `Light` 或 `LightSource`；欄位名稱忽略大小寫與 namespace。
+若沒有這些欄位，才從來源檔名 `{Component Name}_{Pad ID}_{光源}` 取得，支援
+`SolderLight`、`UniformLight`（忽略大小寫）及光源後的數字後綴。
+
+Component Name 預設使用 XML `CompName`。只有來源檔名能確認
+`CompName == {Component Name}_{Pad ID}` 時，才去除末尾的 Pad ID，避免重複。
+例如 XML 的 `CompName="U5009_1"` 搭配 `U5009_1_SolderLight.jpg`，會取得
+Component Name `U5009`、Pad ID `1`；資料夾仍使用完整的 `U5009_1`。
+`IC_TOP_3_UniformLight_2.jpg` 也可解析為 `IC_TOP`、`3`、`UniformLight`。
+若缺少 XML `CompName`，重新命名時的 Component Name 可以回退到檔名解析值，
+但 `comp-name` 資料夾仍會明確標記為缺少 XML 欄位。
+
+將資料夾分成 `CompName/Type/PackageType`，並使用完整的新檔名：
+
+```bash
+uv run scripts/crop_images.py -x ./XML -i ./IMG -o ./BY_COMPONENT \
+    --output-layout comp-type-package \
+    --filename-format type-package-component
+```
+
+上述例子的輸出是：
+
+```text
+BY_COMPONENT/U5009_1/32-350177-01/IC/32-350177-01_IC_U5009_1_SolderLight.jpg
+```
+
+三種重新命名模式會實際轉存為 RGB JPEG（quality 95），包含 PNG 等來源格式，
+不只是修改副檔名。`original` 則維持目前的裁切存檔方式與副檔名。
+
+所選結構或命名格式需要的欄位若缺少，會使用 `_missing_CompName`、
+`_missing_Type`、`_missing_PackageType`、`_missing_PadID`、`_missing_Light`
+等標記，記錄 warning 並增加 `missing_metadata`，仍繼續裁切。
+未使用的欄位缺少時不會告警。
+XML 欄位中的斜線、冒號、控制字元等會替換成 `_`；無法構成有效名稱時使用
+`_invalid_{欄位}`，Windows 保留名稱會加前置 `_`。對照表保留未清理的原始值。
+
+新檔名的 `Type`／`PackageType` 前綴會被目前的 `group_images.py` 當作
+Component Name 的一部分。人工檢查時可直接使用這支程式分好的資料夾。
+若使用 PyTorch ImageFolder 訓練，第一層資料夾會作為類別；請依模型目標選擇
+分組方式，或在人工確認後重新整理為最終類別目錄。
+
+### 來源對照表
+
+加上 `--manifest` 可以產生 UTF-8 CSV（含 BOM，方便用 Excel 開啟）：
+
+```bash
+uv run scripts/crop_images.py -x ./XML -i ./IMG -o ./BY_TYPE \
+    --output-layout type --filename-format package-component \
+    --manifest ./BY_TYPE/manifest.csv
+```
+
+每列記錄本次成功寫出的影像：來源 XML／影像、相對來源路徑、最終輸出路徑
+（包含同名檔後綴）、原始 `CompName`／`Type`／`PackageType`、Component Name、
+Pad ID、光源、BoardSN、Board 的 imulti，以及正規化並限制在影像邊界內的裁切座標。
+`missing_fields` 列出所選輸出模式缺少的欄位。
+失敗或 `--on-exists skip` 跳過的影像不列入。
+
+**每次執行會覆蓋指定的 CSV，只保留本次成功寫出的紀錄**，可為不同執行指定不同
+CSV 檔名；`--on-exists` 僅控制影像。`--dry-run` 會顯示預計輸出路徑，
+不寫影像、對照表或建立輸出目錄。
 
 ### 輸入格式的容錯
 
@@ -114,11 +210,14 @@ INFO Done. Summary:
   no_anchor         : 1     # PicPath 中找不到錨點片段
   missing_source    : 1     # 找不到來源影像
   bad_region        : 1     # 座標缺漏、非數值或區域為空
+  missing_metadata  : 0     # 所選輸出模式所需欄位缺少的影像數
   read_errors       : 0     # 無法讀取或裁切的來源影像
 ```
 
 離開碼（exit code）：成功為 `0`（找不到任何 XML 檔也是 `0`），
-`--xml-dir` 或 `--image-dir` 不存在時為 `2`。
+`--xml-dir` 或 `--image-dir` 不存在、輸入與輸出目錄相同、manifest 副檔名不是
+`.csv` 時為 `2`；對照表寫入失敗時為 `1`。單張影像的錯誤延續目前行為，
+以日誌與統計回報，整批仍回傳 `0`，請檢查統計內容。
 
 ## crop_components.py
 
