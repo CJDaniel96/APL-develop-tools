@@ -7,6 +7,10 @@ An image is OK only when:
 * every OK bounding-box centre is inside the configured image-centre region;
 * no non-OK bounding box is fully contained by an OK bounding box.
 
+Both regular detection and oriented bounding box (OBB) models are supported.
+OBB containment uses the rotated corners, while Pascal VOC annotations use
+the axis-aligned enclosing rectangle because VOC cannot retain rotation.
+
 Non-OK detections outside every OK bounding box are ignored.  If an image has
 no OK detection, any non-OK detection makes it NG.  NG images are saved below
 the class-name folder of the qualifying NG detection with the smallest class
@@ -52,12 +56,13 @@ _ORIGINAL_DIR = "original"
 
 @dataclass(frozen=True)
 class Detection:
-    """One YOLO detection in absolute image coordinates."""
+    """Absolute image coordinates: enclosing bbox and optional OBB corners."""
 
     class_id: int
     label: str
     confidence: float
     bbox: tuple[float, float, float, float]
+    polygon: tuple[tuple[float, float], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,44 @@ def bbox_is_contained(
     return ox1 <= ix1 and oy1 <= iy1 and ix2 <= ox2 and iy2 <= oy2
 
 
+def detection_is_contained(inner: Detection, outer: Detection) -> bool:
+    """Check full containment using rotated corners when available.
+
+    Args:
+        inner: Detection whose entire box must be inside the outer box.
+        outer: Detection defining the containing rectangle.
+
+    Returns:
+        Whether all inner corners are inside or on the outer boundary.
+    """
+    if outer.polygon is None:
+        return bbox_is_contained(inner.bbox, outer.bbox)
+
+    polygon = outer.polygon
+    edges = tuple(zip(polygon, polygon[1:] + polygon[:1]))
+    signed_area = sum(
+        x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in edges
+    )
+    if abs(signed_area) <= 1e-12:
+        return False
+    direction = 1 if signed_area > 0 else -1
+
+    corners = inner.polygon
+    if corners is None:
+        x1, y1, x2, y2 = inner.bbox
+        corners = ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
+
+    for (x1, y1), (x2, y2) in edges:
+        dx, dy = x2 - x1, y2 - y1
+        # Allow 0.0001 pixel of roundoff from float32 OBB coordinates.
+        tolerance = 1e-4 * math.hypot(dx, dy)
+        for x, y in corners:
+            cross = dx * (y - y1) - dy * (x - x1)
+            if direction * cross < -tolerance:
+                return False
+    return True
+
+
 def safe_folder_name(label: str) -> str:
     """Make a model label safe to use as one folder name."""
     cleaned = re.sub(r"[^\w.-]+", "_", label, flags=re.UNICODE)
@@ -166,7 +209,7 @@ def classify_detections(
             ng_detection
             for ng_detection in other_detections
             if any(
-                bbox_is_contained(ng_detection.bbox, ok_detection.bbox)
+                detection_is_contained(ng_detection, ok_detection)
                 for ok_detection in ok_detections
             )
         ]
@@ -265,23 +308,32 @@ def detections_from_result(
     result: Any,
     names: Mapping[int, str],
 ) -> list[Detection]:
-    """Convert an Ultralytics Results object's boxes to plain values."""
-    boxes = result.boxes
+    """Convert regular or OBB results to absolute-coordinate detections."""
+    obb = getattr(result, "obb", None)
+    boxes = obb if obb is not None else result.boxes
     if boxes is None or len(boxes) == 0:
         return []
 
-    class_ids = boxes.cls.detach().cpu().tolist()
-    confidences = boxes.conf.detach().cpu().tolist()
-    coordinates = boxes.xyxy.detach().cpu().tolist()
+    boxes = boxes.cpu()
+    class_ids = boxes.cls.tolist()
+    confidences = boxes.conf.tolist()
+    coordinates = boxes.xyxy.tolist()
+    polygons = (
+        boxes.xyxyxyxy.tolist() if obb is not None else [None] * len(boxes)
+    )
     return [
         Detection(
             class_id=int(class_id),
             label=names.get(int(class_id), f"class_{int(class_id)}"),
             confidence=float(confidence),
             bbox=tuple(float(value) for value in bbox),
+            polygon=(
+                tuple((float(x), float(y)) for x, y in polygon)
+                if polygon is not None else None
+            ),
         )
-        for class_id, confidence, bbox
-        in zip(class_ids, confidences, coordinates, strict=True)
+        for class_id, confidence, bbox, polygon
+        in zip(class_ids, confidences, coordinates, polygons, strict=True)
     ]
 
 
@@ -373,7 +425,7 @@ def write_pascal_voc(
     depth: int,
     detections: Sequence[Detection],
 ) -> None:
-    """Write all model detections as one Pascal VOC XML annotation."""
+    """Write VOC boxes, using axis-aligned enclosing rectangles for OBB."""
     width, height = image_size
     annotation = ET.Element("annotation")
     ET.SubElement(annotation, "folder").text = image_path.parent.name
@@ -459,8 +511,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Run Ultralytics YOLO inference and sort review artifacts into "
-            "OK and NG folders."
+            "Run Ultralytics YOLO detection or OBB inference and sort "
+            "review artifacts into OK and NG folders."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -468,7 +520,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-m",
         "--model",
         required=True,
-        help="Ultralytics model path or model name, e.g. best.pt.",
+        help="Ultralytics detection or OBB model path/name, e.g. best.pt.",
     )
     parser.add_argument(
         "-s",

@@ -8,7 +8,7 @@ AOI（自動光學檢測）開發用的工具集合。目前包含六支 CLI：
 | [`scripts/crop_components.py`](scripts/crop_components.py) | 依 Component Name 或 Type 清單篩選影像，從同名 XML 讀取 bbox 並裁切元件 |
 | [`scripts/group_images.py`](scripts/group_images.py) | 將裁切後的影像依光源篩選，並依 Component Name 分類到子資料夾 |
 | [`scripts/rotate_images.py`](scripts/rotate_images.py) | 依 pixel size 判斷方向，將影像統一旋轉為橫向或豎向 |
-| [`scripts/yolo_classify.py`](scripts/yolo_classify.py) | 使用 Ultralytics YOLO 推論，依 bbox 與 label 規則分類保存到 OK/NG |
+| [`scripts/yolo_classify.py`](scripts/yolo_classify.py) | 使用 Ultralytics YOLO detection／OBB 推論，依框與 label 規則分類保存到 OK/NG |
 | [`scripts/e2e_infer.py`](scripts/e2e_infer.py) | end-to-end 推論驗證：方向校正 → YOLO → HOAM 類別路由 → anomaly 模型 |
 
 ## 環境需求
@@ -500,7 +500,9 @@ uv run scripts/rotate_images.py \
 
 ## yolo_classify.py
 
-使用 Ultralytics YOLO 模型遞迴推論影像，依判定結果存到 `OK` 或 `NG` 資料夾。
+使用 Ultralytics YOLO detection 或 OBB（旋轉框）模型遞迴推論影像，
+依判定結果存到 `OK` 或 `NG` 資料夾。模型任務由 Ultralytics 自動辨識，
+不需要另外指定 OBB 開關。
 每個最終分類會同時保存畫有 bbox、label 與 confidence 的推論效果圖，以及可匯入
 CVAT review 的原始影像與 Pascal VOC XML。
 
@@ -512,8 +514,13 @@ CVAT review 的原始影像與 Pascal VOC XML。
 2. 每個 OK bbox 的中心點都位於影像中央區域。
 3. 其他 label 的 bbox 沒有完整落在任一 OK bbox 內。
 
-其他 label 位於所有 OK bbox 外時不影響結果；沒有偵測到 OK label、但有其他 label
-時，直接判為 NG。若有多個有效 NG label，影像放在 class id 最小的 label 子資料夾。
+其他 label 的框未完整包含在任一 OK 框內時不影響結果（包含只有部分重疊的框）；
+沒有偵測到 OK label、但有其他 label 時，直接判為 NG。若有多個有效 NG label，
+影像放在 class id 最小的 label 子資料夾。
+
+OBB 模型使用旋轉框的實際四個頂點判斷完整包含，邊界接觸也算包含；
+位於水平外接矩形內、卻在旋轉框外的 detection 不會因此被判為有效 NG。
+中心位置仍以框的中心計算，OK 數量與中央區域規則相同。
 
 輸出結構：
 
@@ -541,6 +548,9 @@ CVAT 逐框 review、修正或補標。完全沒有 detection 時仍會產生不
 有效 Pascal VOC XML。當檔名衝突且使用預設 `--on-exists suffix` 時，效果圖、原圖
 與 XML 會套用相同流水號，維持配對關係。
 
+OBB 的推論效果圖會畫出旋轉框。Pascal VOC XML 的 `<bndbox>` 使用各旋轉框的
+**水平外接矩形**，不保留旋轉角度或四角座標；匯入 CVAT 後會是一般矩形框。
+
 ### 基本用法
 
 例如模型中的 `component_ok` 必須出現一次：
@@ -551,6 +561,17 @@ uv run scripts/yolo_classify.py \
     --model ./best.pt \
     --source ./IMAGES \
     --output-dir ./RESULTS \
+    --ok-label component_ok \
+    --ok-count 1
+```
+
+使用自行訓練的 OBB 模型時，沿用相同參數即可，`--ok-label` 須對應該模型的類別名稱：
+
+```bash
+uv run scripts/yolo_classify.py \
+    --model ./best-obb.pt \
+    --source ./IMAGES \
+    --output-dir ./RESULTS_OBB \
     --ok-label component_ok \
     --ok-count 1
 ```
@@ -574,7 +595,7 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 
 | 參數 | 預設 | 說明 |
 | --- | --- | --- |
-| `-m`, `--model` | （必填） | `.pt` 模型路徑或 Ultralytics 模型名稱 |
+| `-m`, `--model` | （必填） | detection／OBB 的 `.pt` 模型路徑或 Ultralytics 模型名稱 |
 | `-s`, `--source` | （必填） | 單一影像或要遞迴搜尋的目錄 |
 | `-o`, `--output-dir` | （必填） | 輸出根目錄；分類下建立 `inference/`、`original/` |
 | `--ok-label` | （必填） | 模型中代表 OK 的完整 label name，區分大小寫 |

@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import numpy as np
+import torch
+from ultralytics.engine.results import Results
 
 from scripts.yolo_classify import (
     Detection,
     bbox_is_contained,
     bbox_is_in_image_center,
     classify_detections,
+    detection_is_contained,
+    detections_from_result,
+    save_review_artifacts,
     unique_output_targets,
     write_pascal_voc,
 )
@@ -26,6 +34,11 @@ def detection(
 
 
 class GeometryTest(unittest.TestCase):
+    diamond = Detection(
+        5, "good", 0.9, (20, 20, 80, 80),
+        ((50, 20), (80, 50), (50, 80), (20, 50)),
+    )
+
     def test_center_uses_bbox_center(self) -> None:
         self.assertTrue(
             bbox_is_in_image_center((40, 40, 60, 60), (100, 100), 0.1)
@@ -37,6 +50,112 @@ class GeometryTest(unittest.TestCase):
     def test_containment_requires_all_edges_inside(self) -> None:
         self.assertTrue(bbox_is_contained((20, 20, 30, 30), (10, 10, 40, 40)))
         self.assertFalse(bbox_is_contained((5, 20, 30, 30), (10, 10, 40, 40)))
+
+
+    def test_rotated_containment_ignores_empty_aabb_corners(self) -> None:
+        inner = detection(1, "scratch", (21, 21, 29, 29))
+        self.assertTrue(bbox_is_contained(inner.bbox, self.diamond.bbox))
+        self.assertFalse(detection_is_contained(inner, self.diamond))
+
+    def test_rotated_containment_requires_all_corners_inside(self) -> None:
+        inner = detection(1, "scratch", (25, 25, 55, 55))
+        self.assertTrue(bbox_is_contained(inner.bbox, self.diamond.bbox))
+        self.assertFalse(detection_is_contained(inner, self.diamond))
+
+    def test_contained_obb_uses_its_actual_corners(self) -> None:
+        inner = Detection(
+            1, "scratch", 0.9, (23, 23, 77, 77),
+            ((50, 23), (77, 50), (50, 77), (23, 50)),
+        )
+        self.assertTrue(detection_is_contained(inner, self.diamond))
+        reversed_outer = Detection(
+            5, "good", 0.9, self.diamond.bbox,
+            tuple(reversed(self.diamond.polygon)),
+        )
+        self.assertTrue(detection_is_contained(inner, reversed_outer))
+
+    def test_rotated_boundary_is_inclusive(self) -> None:
+        self.assertTrue(detection_is_contained(self.diamond, self.diamond))
+        inner = detection(1, "scratch", (40, 30, 60, 50))
+        self.assertTrue(detection_is_contained(inner, self.diamond))
+
+    def test_obb_inside_regular_box(self) -> None:
+        outer = detection(5, "good", (10, 10, 90, 90))
+        self.assertTrue(detection_is_contained(self.diamond, outer))
+
+    def test_degenerate_obb_does_not_contain_detections(self) -> None:
+        outer = Detection(
+            5, "good", 0.9, (50, 20, 50, 80),
+            ((50, 20), (50, 80), (50, 80), (50, 20)),
+        )
+        self.assertFalse(detection_is_contained(self.diamond, outer))
+
+
+class ResultConversionTest(unittest.TestCase):
+    names = {5: "good", 1: "scratch"}
+
+    def test_regular_results_keep_existing_boxes(self) -> None:
+        result = Results(
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            path="part.jpg", names=self.names,
+            boxes=torch.tensor([[20, 30, 80, 70, 0.9, 5]]),
+        )
+        items = detections_from_result(result, self.names)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].class_id, 5)
+        self.assertEqual(items[0].label, "good")
+        self.assertAlmostEqual(items[0].confidence, 0.9)
+        self.assertEqual(items[0].bbox, (20, 30, 80, 70))
+        self.assertIsNone(items[0].polygon)
+
+    def test_obb_results_preserve_geometry_and_classification(self) -> None:
+        result = Results(
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            path="part.jpg", names=self.names,
+            obb=torch.tensor([
+                [50, 50, 40, 40, math.pi / 4, 0.9, 5],
+                [25, 25, 4, 4, math.pi / 4, 0.8, 1],
+            ]),
+        )
+        self.assertIsNone(result.boxes)
+        items = detections_from_result(result, self.names)
+
+        self.assertEqual([item.class_id for item in items], [5, 1])
+        self.assertEqual([item.label for item in items], ["good", "scratch"])
+        self.assertAlmostEqual(items[0].confidence, 0.9)
+        self.assertEqual(len(items[0].polygon), 4)
+        for actual, expected in zip(
+            items[0].bbox,
+            (50 - 20 * math.sqrt(2),) * 2
+            + (50 + 20 * math.sqrt(2),) * 2,
+            strict=True,
+        ):
+            self.assertAlmostEqual(actual, expected, places=4)
+        decision = classify_detections(items, 5, 1, (100, 100), 0.25)
+        self.assertTrue(decision.is_ok)
+
+    def test_numpy_obb_results_and_unknown_class(self) -> None:
+        result = Results(
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            path="part.jpg", names=self.names,
+            obb=np.array([[50, 50, 60, 20, 0.5, 0.8, 9]]),
+        )
+        items = detections_from_result(result, self.names)
+        self.assertEqual(items[0].label, "class_9")
+        self.assertEqual(len(items[0].polygon), 4)
+
+    def test_empty_results_for_both_model_types(self) -> None:
+        for kwargs in (
+            {"boxes": torch.empty((0, 6))},
+            {"obb": torch.empty((0, 7))},
+        ):
+            with self.subTest(kind=next(iter(kwargs))):
+                result = Results(
+                    np.zeros((100, 100, 3), dtype=np.uint8),
+                    path="part.jpg", names=self.names, **kwargs,
+                )
+                self.assertEqual(detections_from_result(result, self.names), [])
 
 
 class ClassificationTest(unittest.TestCase):
@@ -84,6 +203,21 @@ class ClassificationTest(unittest.TestCase):
 
         self.assertTrue(result.is_ok)
 
+    def test_ng_inside_rotated_ok_is_ng(self) -> None:
+        result = self.classify([
+            GeometryTest.diamond,
+            detection(1, "crack", (40, 40, 60, 60)),
+        ])
+        self.assertFalse(result.is_ok)
+        self.assertEqual(result.folder, "crack")
+
+    def test_ng_in_aabb_corner_outside_rotated_ok_is_ignored(self) -> None:
+        result = self.classify([
+            GeometryTest.diamond,
+            detection(1, "crack", (21, 21, 29, 29)),
+        ])
+        self.assertTrue(result.is_ok)
+
     def test_no_ok_uses_lowest_ng_class_id(self) -> None:
         result = self.classify(
             [
@@ -122,6 +256,40 @@ class ClassificationTest(unittest.TestCase):
 
 
 class ReviewArtifactTest(unittest.TestCase):
+    def test_obb_review_outputs_plot_and_enclosing_voc_box(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "part.png"
+            Image.new("RGB", (100, 100)).save(source)
+            result = Results(
+                np.zeros((100, 100, 3), dtype=np.uint8),
+                path=str(source), names={5: "good"},
+                obb=torch.tensor([
+                    [50, 50, 40, 40, math.pi / 4, 0.9, 5],
+                ]),
+            )
+            targets = unique_output_targets(
+                Path(temporary) / "OK", source.name, set(), "suffix",
+            )
+            assert targets is not None
+            save_review_artifacts(
+                result, source, targets,
+                detections_from_result(result, result.names), (100, 100),
+            )
+
+            self.assertTrue(all(path.exists() for path in targets.all()))
+            self.assertEqual(source.read_bytes(), targets.original.read_bytes())
+            with Image.open(targets.inference) as preview:
+                self.assertEqual(preview.size, (100, 100))
+                self.assertIsNotNone(preview.getbbox())
+            root = ET.parse(targets.annotation).getroot()
+            self.assertEqual(root.findtext("object/name"), "good")
+            self.assertEqual(root.findtext("object/bndbox/xmin"), "21")
+            self.assertEqual(root.findtext("object/bndbox/ymin"), "21")
+            self.assertEqual(root.findtext("object/bndbox/xmax"), "79")
+            self.assertEqual(root.findtext("object/bndbox/ymax"), "79")
+
     def test_voc_xml_contains_image_metadata_and_all_detections(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             original = Path(temporary) / "OK" / "original" / "part.jpg"
