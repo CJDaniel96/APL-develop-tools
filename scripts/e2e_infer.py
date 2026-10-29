@@ -74,10 +74,13 @@ from scripts.rotate_images import (  # noqa: E402
     orientation_for_size,
 )
 from scripts.yolo_classify import (  # noqa: E402
+    Decision,
     OutputTargets,
+    add_obb_arguments,
     classify_detections,
     detections_from_result,
     normalize_names,
+    obb_rules_from_args,
     resolve_ok_class_id,
     safe_folder_name,
     save_review_artifacts,
@@ -131,6 +134,7 @@ class ImageTrace:
     stage: str = "input"
     yolo_verdict: str = ""
     yolo_reason: str = ""
+    yolo_measurements: dict[str, Any] | None = None
     yolo_output: str = ""
     yolo_ok_bbox: tuple[int, int, int, int] | None = None
     yolo_crop: str = ""
@@ -320,6 +324,9 @@ def run_yolo_stage(
     model = YOLO(args.yolo_model)
     names = normalize_names(model.names)
     ok_class_id = resolve_ok_class_id(names, args.ok_label)
+    obb_rules = obb_rules_from_args(args)
+    if obb_rules.enabled and model.task != "obb":
+        raise ValueError("OBB geometry limits require an OBB model")
     _LOGGER.info(
         "YOLO OK class is %s (id=%d), expected count=%d",
         args.ok_label,
@@ -361,6 +368,11 @@ def run_yolo_stage(
                 ok_count=args.ok_count,
                 image_size=(width, height),
                 center_tolerance=args.center_tolerance,
+                ok_overlap_iou=args.ok_overlap_iou,
+                obb_rules=(
+                    obb_rules if getattr(result, "obb", None) is not None
+                    else None
+                ),
             )
         except Exception as exc:  # Keep processing the rest of a production run.
             _LOGGER.warning("YOLO inference failed for %s: %s", oriented, exc)
@@ -369,6 +381,8 @@ def run_yolo_stage(
             continue
 
         trace.yolo_reason = decision.reason
+        if decision.measurements is not None:
+            trace.yolo_measurements = asdict(decision.measurements)
         if decision.is_ok:
             trace.yolo_verdict = "OK"
             if args.anomaly_model == "anomaly_dino":
@@ -412,6 +426,7 @@ def run_yolo_stage(
                     image_size=(width, height),
                     used_outputs=used_outputs,
                     args=args,
+                    decision=decision,
                 )
                 if saved is not None:
                     trace.yolo_output = str(saved.inference)
@@ -432,6 +447,7 @@ def run_yolo_stage(
             image_size=(width, height),
             used_outputs=used_outputs,
             args=args,
+            decision=decision,
         )
         if saved is not None:
             trace.yolo_output = str(saved.inference)
@@ -497,6 +513,7 @@ def _save_yolo_artifacts(
     image_size: tuple[int, int],
     used_outputs: set[Path],
     args: argparse.Namespace,
+    decision: Decision | None = None,
 ) -> OutputTargets | None:
     """Saves the review artifacts of one image, as ``yolo_classify`` does.
 
@@ -513,12 +530,16 @@ def _save_yolo_artifacts(
         image_size: ``(width, height)`` of ``scored``.
         used_outputs: Paths already reserved during this run.
         args: Parsed CLI arguments.
+        decision: Verdict and optional OBB measurements to save.
 
     Returns:
         The written paths, or None when nothing was written.
     """
     targets = unique_output_targets(
-        category_dir, filename, used_outputs, args.on_exists
+        category_dir, filename, used_outputs, args.on_exists,
+        include_measurements=(
+            decision is not None and decision.measurements is not None
+        ),
     )
     if targets is None:
         _LOGGER.debug("Exists, skipping: %s", category_dir / filename)
@@ -534,6 +555,7 @@ def _save_yolo_artifacts(
             targets=targets,
             detections=detections,
             image_size=image_size,
+            decision=decision,
         )
     except (OSError, ValueError) as exc:
         _LOGGER.warning("Could not save %s: %s", targets.inference, exc)
@@ -1241,7 +1263,7 @@ def _jet(values: Any) -> Any:
 def _unique_path(target: Path, used: set[Path], on_exists: str) -> Path | None:
     """Chooses a non-colliding output path according to the CLI policy.
 
-    ``yolo_classify`` reserves three related review paths at once; the anomaly
+    ``yolo_classify`` reserves its related review paths together; the anomaly
     stage writes one image per decision, so it needs the single-path variant.
 
     Args:
@@ -1310,6 +1332,8 @@ def write_report(
         "yolo_model": str(args.yolo_model),
         "ok_label": args.ok_label,
         "ok_count": args.ok_count,
+        "ok_overlap_iou": args.ok_overlap_iou,
+        "obb_rules": asdict(obb_rules_from_args(args)),
         "anomaly_model": args.anomaly_model,
         "anomaly_model_dir": str(args.anomaly_model_dir),
         "dry_run": args.dry_run,
@@ -1322,7 +1346,13 @@ def write_report(
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=[f.name for f in fields(ImageTrace)])
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            csv_row = dict(row)
+            if row["yolo_measurements"] is not None:
+                csv_row["yolo_measurements"] = json.dumps(
+                    row["yolo_measurements"], allow_nan=False
+                )
+            writer.writerow(csv_row)
     return json_path, csv_path
 
 
@@ -1417,12 +1447,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     yolo.add_argument(
         "--ok-count", required=True, type=_positive_int,
-        help="Exact number of OK detections required.",
+        help="Exact number of OK objects required.",
+    )
+    yolo.add_argument(
+        "--ok-overlap-iou", type=float, default=0.8, metavar="RATIO",
+        help="For --ok-count 1, count OK boxes as one if every pair has "
+             "IoU >= this threshold (0-1); 0 disables it.",
     )
     yolo.add_argument(
         "--center-tolerance", type=_unit_interval, default=0.25, metavar="RATIO",
         help="Allowed OK bbox-centre offset from the image centre per axis.",
     )
+    add_obb_arguments(yolo)
     yolo.add_argument("--conf", type=float, default=0.25,
                       help="YOLO confidence threshold.")
     yolo.add_argument("--iou", type=float, default=0.7,
@@ -1550,6 +1586,12 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "--conf must be between 0.0 and 1.0"
     if not 0.0 <= args.iou <= 1.0:
         return "--iou must be between 0.0 and 1.0"
+    if not 0.0 <= args.ok_overlap_iou <= 1.0:
+        return "--ok-overlap-iou must be between 0.0 and 1.0"
+    try:
+        obb_rules_from_args(args)
+    except ValueError as exc:
+        return str(exc)
     if args.imgsz < 1:
         return "--imgsz must be at least 1"
     if not args.anomaly_model_dir.exists():

@@ -510,9 +510,10 @@ CVAT review 的原始影像與 Pascal VOC XML。
 
 影像必須同時符合以下條件才是 OK：
 
-1. `--ok-label` 的偵測數量精確等於 `--ok-count`。
-2. 每個 OK bbox 的中心點都位於影像中央區域。
+1. `--ok-label` 的偵測數量等於 `--ok-count`；要求 1 個時可將幾乎重疊的重複框計為 1 個。
+2. 每個計入數量的 OK 框中心都位於影像中央區域；重複框使用信心最高的框。
 3. 其他 label 的 bbox 沒有完整落在任一 OK bbox 內。
+4. 若啟用 OBB 幾何門檻，角度、中心距離與物件最短邊距也都必須合格。
 
 其他 label 的框未完整包含在任一 OK 框內時不影響結果（包含只有部分重疊的框）；
 沒有偵測到 OK label、但有其他 label 時，直接判為 NG。若有多個有效 NG label，
@@ -521,6 +522,16 @@ CVAT review 的原始影像與 Pascal VOC XML。
 OBB 模型使用旋轉框的實際四個頂點判斷完整包含，邊界接觸也算包含；
 位於水平外接矩形內、卻在旋轉框外的 detection 不會因此被判為有效 NG。
 中心位置仍以框的中心計算，OK 數量與中央區域規則相同。
+
+當 `--ok-count 1` 卻偵測到多個 OK 框時，程式會比較**所有 OK 框的兩兩 IoU**
+（交集面積 ÷ 聯集面積）。只有每一對都大於等於 `--ok-overlap-iou`（預設 `0.80`），
+才視為同一個物件並計為 1 個，以信心最高的框檢查中央位置。
+一般框使用矩形 IoU，OBB 使用旋轉框實際多邊形的 IoU。分開的物件、
+只有部分框高度重疊，或 A 與 B、B 與 C 高度重疊但 A 與 C 不符合門檻，仍會判為數量不符。
+`--ok-count` 大於 1 時維持原本的精確數量規則。
+
+這項處理只調整 OK 數量與中心位置的判定；缺陷包含關係仍檢查所有原始 OK 框，
+效果圖與 XML 也保留所有模型 detection。日誌會記錄重複框數量與最小 IoU，方便調整門檻。
 
 輸出結構：
 
@@ -551,6 +562,54 @@ CVAT 逐框 review、修正或補標。完全沒有 detection 時仍會產生不
 OBB 的推論效果圖會畫出旋轉框。Pascal VOC XML 的 `<bndbox>` 使用各旋轉框的
 **水平外接矩形**，不保留旋轉角度或四角座標；匯入 CVAT 後會是一般矩形框。
 
+### OBB 角度、中心距離與物件間距
+
+OBB 模型會自動量測每個計入數量的 OK 物件，並在日誌與分類目錄下的
+`measurements/<影像檔名>.json` 保存數值。距離單位均為推論來源影像的 **pixel（px）**，
+不以 `--imgsz` 的縮放尺寸計算，也不換算為實際毫米。
+
+- **角度**：使用旋轉框長邊相對水平向右的角度，影像座標的順時針為正，
+  輸出範圍為 `[-90°, 90°)`，水平為 `0°`、垂直為 `-90°`。
+  從四角重算長軸，避免模型寬／高互換時角度改變 90°，
+  參見 [Ultralytics OBB 輸出說明](https://docs.ultralytics.com/tasks/obb/#results-output)。
+  完全正方形以較接近水平的軸作為基準；接近正方形的框可能因長短邊交換而改變角度。
+- **中心距離**：框中心到影像中心 `(width / 2, height / 2)` 的歐氏距離。
+  JSON 另存中心座標及有正負號的 `offset_x_px`、`offset_y_px`（右／下為正）。
+- **物件間距**：計算所有 OK 框兩兩之間的最短距離，包含邊中段到頂點的距離，
+  使用實際旋轉框，而非水平外接矩形或兩物件中心距離。
+  相交、接觸、互相包含均視為 `0 px`；只有一個 OK 物件時，最小邊距為 `null`。
+
+新增門檻預設關閉，只量測、不因新增條件判 NG。例：要求兩個水平 OK 物件，
+角度允許偏差 5°、各自離影像中心最多 100 px、框與框之間至少 10 px：
+
+```bash
+uv run scripts/yolo_classify.py \
+    --model ./best-obb.pt --source ./IMAGES --output-dir ./RESULTS_OBB \
+    --ok-label component_ok --ok-count 2 \
+    --ok-angle-target 0 --ok-angle-tolerance 5 \
+    --ok-max-center-distance 100 --ok-min-edge-distance 10
+```
+
+角度偏差大於容許值、中心距離大於上限，或**任一對**物件邊距小於下限，該張影像會判 NG。
+等於門檻時合格；數值比較容許 `1e-6` 的浮點誤差。未指定的門檻不檢查。
+角度以 180° 為週期，例如 `89°` 和 `-89°` 相差 2°；OBB 角度無法辨別元件旋轉 180° 的反向。
+垂直物件可設定 `--ok-angle-target 90`。`--ok-min-edge-distance 0` 允許框接觸或重疊；
+要將這些情況判 NG，請設定正值。
+
+原本的 `--center-tolerance` 中央區域規則仍同時生效；若希望只使用新的中心距離上限，
+可設為 `--center-tolerance 0.5`。這些幾何門檻僅支援 OBB，套用到一般 detection 模型會回報設定錯誤。
+
+要求一個 OK 時，前述重複框處理會先執行，只量測信心最高的代表框，不會把重複框的 `0 px`
+間距當成兩個物件過近。要求多個 OK 時，維持精確數量規則，不自動合併。
+原圖、效果圖與 VOC XML 仍保留所有 detection。
+
+JSON 的 `measurements.objects` 包含各物件的四角座標、角度、相對目標角度的偏差及中心距離；
+`measurements.pairs` 包含每一對物件的最短邊距，`min_edge_distance_px` 是全圖最小值。
+物件編號由 1 開始，依重複框處理後的 OK detection 順序排列。
+報告同時記錄原始／有效 OK 數量、判定結果、理由與當次門檻。
+因角度、中心距離或間距不符且沒有有效缺陷類別時，影像存入 `NG/_ok_rule/`。
+檔名衝突時 JSON、原圖、效果圖與 XML 會使用相同尾碼；`--dry-run` 僅在日誌顯示量測，不寫出檔案。
+
 ### 基本用法
 
 例如模型中的 `component_ok` 必須出現一次：
@@ -576,6 +635,16 @@ uv run scripts/yolo_classify.py \
     --ok-count 1
 ```
 
+重複 OK 框判定預設啟用，不需要改動原指令。若希望更寬鬆，可降低門檻，例如：
+
+```bash
+uv run scripts/yolo_classify.py -m ./best-obb.pt -s ./IMAGES -o ./RESULTS \
+    --ok-label component_ok --ok-count 1 --conf 0.25 --ok-overlap-iou 0.70
+```
+
+門檻越高，越要求框幾乎一致才計為同一個物件；設為 `0` 可關閉，恢復原始精確數量判定。
+此參數只作用於推論後的 OK/NG 判定，與 YOLO 推論階段的 `--iou`（NMS 門檻）分開。
+
 `--center-tolerance 0.25`（預設）代表 OK bbox 的中心點必須位於影像寬與高的中央
 50% 區域。若要更嚴格限制在中央 20%，可設為 `0.10`：
 
@@ -599,8 +668,13 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 | `-s`, `--source` | （必填） | 單一影像或要遞迴搜尋的目錄 |
 | `-o`, `--output-dir` | （必填） | 輸出根目錄；分類下建立 `inference/`、`original/` |
 | `--ok-label` | （必填） | 模型中代表 OK 的完整 label name，區分大小寫 |
-| `--ok-count` | （必填） | 必須偵測到的精確 OK 數量，至少為 1 |
+| `--ok-count` | （必填） | 必須偵測到的精確 OK 物件數量，至少為 1 |
+| `--ok-overlap-iou` | `0.80` | 要求 1 個 OK 時，所有 OK 框兩兩 IoU 達此門檻則計為 1 個；`0` 關閉 |
 | `--center-tolerance` | `0.25` | bbox 中心相對影像中心的水平、垂直容許比例 |
+| `--ok-angle-target` | `0` | OBB OK 框預期長軸角度，單位 degree，以 180° 為週期 |
+| `--ok-angle-tolerance` | 關閉 | 與目標角度的最大允許偏差，範圍 0–90° |
+| `--ok-max-center-distance` | 關閉 | OBB OK 框中心到影像中心的最大距離，單位 px |
+| `--ok-min-edge-distance` | 關閉 | 任兩個 OBB OK 框的最小允許間距，單位 px |
 | `--conf` | `0.25` | YOLO confidence threshold |
 | `--iou` | `0.7` | YOLO NMS IoU threshold |
 | `--imgsz` | `640` | 推論影像尺寸 |
@@ -653,6 +727,9 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 
 `report.csv` 每列記錄一張影像走過的每一站：方向、是否旋轉、YOLO 判定、OK bbox/crop 與理由、
 HOAM 類別、使用的 checkpoint、anomaly score 與判定、以及所有輸出路徑。
+OBB 模型也會記錄 `yolo_measurements`：`report.json` 使用結構化資料，`report.csv` 的欄位使用 JSON 字串。
+量測座標以方向校正後、實際送入 YOLO 的影像為準。`e2e_infer.py` 支援與 `yolo_classify.py`
+相同的四個 OBB 幾何參數；複判素材有寫出時也會一併保存 `measurements/<檔名>.json`。
 
 ### 安裝
 
@@ -746,7 +823,11 @@ uv run scripts/e2e_infer.py -i ./IMAGES -o ./RESULTS \
 | `--target-orientation` | `landscape` | 所有非正方形影像要轉成的方向 |
 | `--yolo-model` | （必填） | YOLO `.pt` 模型路徑或名稱 |
 | `--ok-label` / `--ok-count` | （必填） | 與 `yolo_classify.py` 完全相同的規則 |
+| `--ok-overlap-iou` | `0.80` | 與 `yolo_classify.py` 相同的重複 OK 框判定；`0` 關閉 |
 | `--center-tolerance` | `0.25` | OK bbox 中心相對影像中心的容許比例 |
+| `--ok-angle-target` / `--ok-angle-tolerance` | `0` / 關閉 | OBB OK 框的目標長軸角度與允許偏差，單位 degree |
+| `--ok-max-center-distance` | 關閉 | OBB OK 框中心距離影像中心的上限，單位 px |
+| `--ok-min-edge-distance` | 關閉 | 兩個 OBB OK 框間距的下限，單位 px |
 | `--save-ok-annotated` | 關閉 | 另外把 YOLO 判 OK 的複判素材寫到 `OK/` |
 | `--anomaly-model` | （必填） | `dinomaly` / `anomaly_dino` / `patchcore`，接受 `anomalydino`、`patch-core` 等別名 |
 | `--anomaly-model-dir` | （必填） | 模型根目錄；有類別路由時每個類別一個子資料夾 |

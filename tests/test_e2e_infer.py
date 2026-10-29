@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
+import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -15,9 +18,12 @@ from scripts.e2e_infer import (
     filter_by_light,
     normalize_anomaly_model,
     orient_images,
+    parse_args,
     parse_image_size,
     resolve_checkpoint,
+    run_yolo_stage,
     save_yolo_ok_crop,
+    validate_args,
 )
 from scripts.yolo_classify import Detection
 
@@ -214,6 +220,64 @@ class TraceTest(unittest.TestCase):
         first = ImageTrace(source="a.png", relative="a.png")
         second = ImageTrace(source="a.png", relative="a.png")
         self.assertEqual(len({first, second}), 2)
+
+
+class YoloOverlapGateTest(unittest.TestCase):
+    def arguments(self, root: Path) -> argparse.Namespace:
+        return parse_args([
+            "--input", str(root / "part.png"),
+            "--output-dir", str(root / "out"),
+            "--yolo-model", "unused.pt", "--ok-label", "good",
+            "--ok-count", "1", "--anomaly-model", "dinomaly",
+            "--anomaly-model-dir", str(root), "--dry-run",
+        ])
+
+    def test_gate_uses_configured_overlap_threshold(self) -> None:
+        import numpy as np
+        import torch
+        from ultralytics.engine.results import Results
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = write_image(root / "part.png", (100, 100))
+            result = Results(
+                np.zeros((100, 100, 3), dtype=np.uint8),
+                path=str(source), names={5: "good"},
+                boxes=torch.tensor([
+                    [20, 20, 80, 80, 0.9, 5],
+                    [21, 21, 81, 81, 0.8, 5],
+                ]),
+            )
+            args = self.arguments(root)
+            self.assertEqual(args.ok_overlap_iou, 0.8)
+            with patch("ultralytics.YOLO") as model_type:
+                model_type.return_value.names = result.names
+                model_type.return_value.predict.return_value = [result]
+                for threshold, verdict in ((0.8, "OK"), (0, "NG")):
+                    with self.subTest(threshold=threshold):
+                        args.ok_overlap_iou = threshold
+                        trace = ImageTrace(
+                            source=str(source), relative=source.name,
+                            oriented=str(source), stage="oriented",
+                        )
+                        stats = Stats()
+                        passed = run_yolo_stage([trace], args, stats)
+                        self.assertEqual(trace.yolo_verdict, verdict)
+                        self.assertEqual(len(passed), int(verdict == "OK"))
+                        self.assertEqual(stats.yolo_errors, 0)
+
+    def test_invalid_overlap_threshold_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_image(root / "part.png", (100, 100))
+            args = self.arguments(root)
+            for value in (-0.1, 1.1, math.nan, math.inf):
+                with self.subTest(value=value):
+                    args.ok_overlap_iou = value
+                    self.assertEqual(
+                        validate_args(args),
+                        "--ok-overlap-iou must be between 0.0 and 1.0",
+                    )
 
 
 class YoloOkCropTest(unittest.TestCase):
