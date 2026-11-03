@@ -7,6 +7,7 @@ import json
 import math
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +24,7 @@ from scripts.yolo_classify import (
     ObbRules,
     classify_detections,
     detection_edge_distance,
+    detections_from_result,
     main,
     measure_ok_objects,
     obb_angle_degrees,
@@ -216,12 +218,12 @@ class ObbRuleTest(unittest.TestCase):
         assert decision.measurements is not None
         self.assertEqual(decision.measurements.effective_ok_count, 2)
 
-    def test_skip_count_checks_all_pairs_without_duplicate_merging(self) -> None:
+    def test_skip_count_checks_all_distinct_pairs(self) -> None:
         for centers, is_ok, min_gap in (
             ((80, 120), True, 20),
             ((80, 105), False, 5),
             ((80, 100), False, 0),
-            ((80, 80.1), False, 0),
+            ((80, 95), False, 0),
             ((50, 90, 130), True, 20),
             ((50, 100, 125), False, 5),
         ):
@@ -246,6 +248,71 @@ class ObbRuleTest(unittest.TestCase):
                     )
                 else:
                     self.assertIn("edge distance", decision.reason)
+
+    def test_skip_count_deduplicates_each_object_before_gap_checks(self) -> None:
+        for second_x, is_ok, gap in (
+            (120, True, 20), (105, False, 5), (95, False, 0),
+        ):
+            items = [
+                obb((80, 50), confidence=0.9),
+                obb((80.1, 50), confidence=0.4),
+                obb((second_x, 50), confidence=0.95),
+                obb((second_x + 0.1, 50), confidence=0.3),
+            ]
+            for ordered in (items, list(reversed(items))):
+                with self.subTest(second_x=second_x, order=ordered):
+                    decision = classify_detections(
+                        ordered, 5, None, (200, 100), 0.5,
+                        obb_rules=ObbRules(min_edge_distance_px=10),
+                    )
+                    self.assertEqual(decision.is_ok, is_ok)
+                    measured = decision.measurements
+                    assert measured is not None
+                    self.assertEqual(measured.raw_ok_count, 4)
+                    self.assertEqual(measured.effective_ok_count, 2)
+                    self.assertEqual(len(measured.pairs), 1)
+                    self.assertAlmostEqual(measured.min_edge_distance_px, gap)
+                    expected = [
+                        item for item in ordered if item.confidence >= 0.9
+                    ]
+                    self.assertEqual(
+                        [item.confidence for item in measured.objects],
+                        [item.confidence for item in expected],
+                    )
+
+    def test_skip_count_duplicate_removal_is_configurable(self) -> None:
+        items = [obb((100, 50)), obb((100.1, 50), confidence=0.4)]
+        for threshold, is_ok, count in (
+            (0.8, True, 1), (0, False, 2), (1, False, 2),
+        ):
+            with self.subTest(threshold=threshold):
+                decision = classify_detections(
+                    items, 5, None, (200, 100), 0.5,
+                    ok_overlap_iou=threshold,
+                    obb_rules=ObbRules(min_edge_distance_px=10),
+                )
+                self.assertEqual(decision.is_ok, is_ok)
+                measured = decision.measurements
+                assert measured is not None
+                self.assertEqual(measured.raw_ok_count, 2)
+                self.assertEqual(measured.effective_ok_count, count)
+                if is_ok:
+                    self.assertEqual(measured.objects[0].confidence, 0.9)
+                    self.assertEqual(measured.pairs, ())
+                    self.assertIsNone(measured.min_edge_distance_px)
+                else:
+                    self.assertEqual(measured.min_edge_distance_px, 0)
+
+    def test_crossed_obbs_remain_distinct_with_zero_gap(self) -> None:
+        decision = classify_detections(
+            [obb((100, 50), 60, 6, 45), obb((100, 50), 60, 6, -45)],
+            5, None, (200, 100), 0.5,
+            obb_rules=ObbRules(min_edge_distance_px=10),
+        )
+        self.assertFalse(decision.is_ok)
+        self.assertIn("edge distance 0.00px below 10.00px", decision.reason)
+        assert decision.measurements is not None
+        self.assertEqual(decision.measurements.effective_ok_count, 2)
 
     def test_skip_count_with_single_obb_has_no_gap_to_check(self) -> None:
         decision = classify_detections(
@@ -380,6 +447,47 @@ class ObbCliTest(unittest.TestCase):
                                 "distance 10.00px below 12.00px",
                                 payload["reason"],
                             )
+
+    def test_cli_ignores_duplicate_obb_gap_and_preserves_review_boxes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "part.png"
+            Image.new("RGB", (284, 160)).save(source)
+            result = Results(
+                np.zeros((160, 284, 3), dtype=np.uint8),
+                path=str(source), names={5: "good"},
+                obb=torch.tensor([
+                    [142.4246, 79.6469, 150.0161, 75.9373,
+                     math.radians(0.1411), 0.3974, 5],
+                    [142.4794, 79.6403, 149.8384, 75.6230,
+                     math.radians(0.0935), 0.3644, 5],
+                ]),
+            )
+            arguments = self.arguments(root)
+            count_index = arguments.index("--ok-count")
+            arguments[count_index:count_index + 2] = ["--skip-ok-count"]
+            with patch("ultralytics.YOLO") as model_type:
+                model = model_type.return_value
+                model.names, model.task = result.names, "obb"
+                model.predict.return_value = [result]
+                with self.assertLogs("yolo_classify", level="INFO"):
+                    self.assertEqual(main(arguments + [
+                        "--ok-min-edge-distance", "10",
+                    ]), 0)
+            payload = json.loads((
+                root / "out/OK/measurements/part.json"
+            ).read_text())
+            self.assertEqual(payload["verdict"], "OK")
+            self.assertIn("counted 2 overlapping OK boxes as 1", payload["reason"])
+            measured = payload["measurements"]
+            self.assertEqual(measured["raw_ok_count"], 2)
+            self.assertEqual(measured["effective_ok_count"], 1)
+            self.assertAlmostEqual(measured["objects"][0]["confidence"], 0.3974)
+            self.assertEqual(measured["pairs"], [])
+            self.assertIsNone(measured["min_edge_distance_px"])
+            self.assertEqual(len(detections_from_result(result, result.names)), 2)
+            annotation = ET.parse(root / "out/OK/original/part.xml")
+            self.assertEqual(len(annotation.getroot().findall("object")), 2)
 
     def test_dry_run_logs_measurements_without_creating_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

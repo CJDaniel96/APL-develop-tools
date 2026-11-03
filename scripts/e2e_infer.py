@@ -1447,12 +1447,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     yolo.add_argument(
         "--ok-count", required=True, type=_positive_int,
-        help="Exact number of OK objects required.",
+        help="Exact number of OK objects required after duplicate removal.",
     )
     yolo.add_argument(
         "--ok-overlap-iou", type=float, default=0.8, metavar="RATIO",
-        help="For --ok-count 1, count OK boxes as one if every pair has "
-             "IoU >= this threshold (0-1); 0 disables it.",
+        help="Group duplicate OK boxes before counting and geometry checks; "
+             "every pair in a group must have IoU >= this threshold (0-1). "
+             "Keep the highest-confidence box; 0 disables grouping.",
     )
     yolo.add_argument(
         "--center-tolerance", type=_unit_interval, default=0.25, metavar="RATIO",

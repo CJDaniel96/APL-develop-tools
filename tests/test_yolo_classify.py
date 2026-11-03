@@ -355,14 +355,14 @@ class ClassificationTest(unittest.TestCase):
     def test_chain_of_overlaps_does_not_merge_separate_endpoints(self) -> None:
         items = [
             detection(5, "good", (20, 20, 80, 80)),
-            detection(5, "good", (24, 20, 84, 80)),
+            Detection(5, "good", 0.99, (24, 20, 84, 80)),
             detection(5, "good", (28, 20, 88, 80)),
         ]
         self.assertGreater(detection_iou(items[0], items[1]), 0.8)
         self.assertGreater(detection_iou(items[1], items[2]), 0.8)
         result = self.classify(items)
         self.assertFalse(result.is_ok)
-        self.assertIn("below overlap threshold", result.reason)
+        self.assertIn("expected 1, detected 2", result.reason)
 
     def test_overlap_threshold_is_configurable_and_inclusive(self) -> None:
         items = [
@@ -376,9 +376,10 @@ class ClassificationTest(unittest.TestCase):
     def test_highest_confidence_box_determines_center(self) -> None:
         inside = Detection(5, "good", 0.95, (16, 20, 36, 40))
         outside = Detection(5, "good", 0.4, (14, 20, 34, 40))
-        for items in ([inside, outside], [outside, inside]):
-            with self.subTest(items=items):
-                self.assertTrue(self.classify(items).is_ok)
+        for ok_count in (1, None):
+            for items in ([inside, outside], [outside, inside]):
+                with self.subTest(ok_count=ok_count, items=items):
+                    self.assertTrue(self.classify(items, ok_count=ok_count).is_ok)
 
     def test_duplicate_off_center_objects_remain_ng(self) -> None:
         result = self.classify([
@@ -389,19 +390,40 @@ class ClassificationTest(unittest.TestCase):
         self.assertIn("outside image centre region", result.reason)
 
     def test_ng_inside_lower_confidence_duplicate_still_counts(self) -> None:
-        result = self.classify([
+        items = [
             Detection(5, "good", 0.95, self.ok_box),
             Detection(5, "good", 0.4, (18, 18, 82, 82)),
             detection(1, "crack", (18.5, 30, 19.5, 40)),
-        ])
-        self.assertFalse(result.is_ok)
-        self.assertEqual(result.folder, "crack")
-        self.assertIn("NG bbox contained", result.reason)
+        ]
+        for ok_count in (1, None):
+            with self.subTest(ok_count=ok_count):
+                result = self.classify(items, ok_count=ok_count)
+                self.assertFalse(result.is_ok)
+                self.assertEqual(result.folder, "crack")
+                self.assertIn("NG bbox contained", result.reason)
 
-    def test_multiple_expected_objects_keep_original_count_rules(self) -> None:
-        items = [detection(5, "good", self.ok_box)] * 2
+    def test_exact_count_uses_distinct_objects_after_duplicate_removal(self) -> None:
+        first = detection(5, "good", (25, 40, 35, 60))
+        second = detection(5, "good", (65, 40, 75, 60))
+        third = detection(5, "good", (45, 40, 55, 60))
+        items = [first, second]
         self.assertTrue(self.classify(items, ok_count=2).is_ok)
-        self.assertFalse(self.classify(items * 2, ok_count=2).is_ok)
+        self.assertTrue(self.classify(items * 2, ok_count=2).is_ok)
+        self.assertFalse(self.classify(items + [third], ok_count=2).is_ok)
+        self.assertFalse(self.classify([first, first], ok_count=2).is_ok)
+        self.assertTrue(self.classify(
+            [first, first], ok_count=2, ok_overlap_iou=0,
+        ).is_ok)
+
+    def test_skip_count_deduplicates_regular_boxes(self) -> None:
+        first = detection(5, "good", (25, 40, 35, 60))
+        second = detection(5, "good", (65, 40, 75, 60))
+        items = [first, first, second, second]
+        result = self.classify(items, ok_count=None)
+        self.assertTrue(result.is_ok)
+        self.assertIn("detected 2 centred", result.reason)
+        self.assertIn("counted 4 overlapping OK boxes as 2", result.reason)
+        self.assertEqual(len(items), 4)
 
     def test_skip_count_requires_ok_and_preserves_other_rules(self) -> None:
         ok = detection(5, "good", self.ok_box)

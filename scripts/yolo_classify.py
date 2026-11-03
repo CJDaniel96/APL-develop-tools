@@ -3,9 +3,8 @@
 
 An image is OK only when:
 
-* the configured OK class occurs exactly ``--ok-count`` times (near-identical
-  boxes can count as one when only one OK object is required), or at least
-  once when ``--skip-ok-count`` is used;
+* after duplicate removal, the configured OK class occurs exactly
+  ``--ok-count`` times, or at least once when ``--skip-ok-count`` is used;
 * each counted OK object's centre is in the configured image-centre region;
 * no non-OK bounding box is fully contained by an OK bounding box.
 * enabled OBB angle, centre-distance and pairwise-separation limits pass.
@@ -306,6 +305,41 @@ def detection_iou(first: Detection, second: Detection) -> float:
     return intersection / union
 
 
+def deduplicate_ok_detections(
+    detections: Sequence[Detection],
+    iou_threshold: float,
+) -> list[Detection]:
+    """Keep one highest-confidence box per group of near-identical OK boxes.
+
+    Every pair within a group must meet the IoU threshold, so a chain of
+    overlaps cannot collapse separate endpoints into a single object.
+    Representatives retain their original order. Zero disables grouping.
+    """
+    if iou_threshold <= 0 or len(detections) < 2:
+        return list(detections)
+
+    groups: list[list[tuple[int, Detection]]] = []
+    for indexed in sorted(
+        enumerate(detections), key=lambda item: item[1].confidence, reverse=True,
+    ):
+        _, detection = indexed
+        for group in groups:
+            if all(
+                detection_iou(detection, member) >= iou_threshold
+                for _, member in group
+            ):
+                group.append(indexed)
+                break
+        else:
+            groups.append([indexed])
+
+    return [
+        detection for _, detection in sorted(
+            (group[0] for group in groups), key=lambda item: item[0],
+        )
+    ]
+
+
 def detection_corners(
     detection: Detection,
 ) -> tuple[tuple[float, float], ...]:
@@ -513,15 +547,15 @@ def classify_detections(
     ok_overlap_iou: float = 0.8,
     obb_rules: ObbRules | None = None,
 ) -> Decision:
-    """Apply AOI rules, optionally counting overlapping OK boxes as one.
+    """Apply AOI rules after removing near-identical OK detections.
 
-    When exactly one OK object is required, all OK boxes must overlap each
-    other by at least ``ok_overlap_iou`` to count as one.  Its centre is taken
-    from the highest-confidence box.  NG containment always uses every
-    original OK box, and the input detections are left intact for review.
-    Set ``ok_overlap_iou`` to zero to require the original exact count.
+    Duplicate groups require pairwise IoU >= ``ok_overlap_iou``. Each group's
+    highest-confidence box is used for counting, centre and geometry checks.
+    NG containment always uses every original OK box, and input detections
+    are left intact for review. Set ``ok_overlap_iou`` to zero to disable
+    duplicate removal in every count mode.
     Set ``ok_count`` to None to require at least one OK object without an
-    exact count or duplicate merging; all OK boxes retain the other checks.
+    exact count; duplicate removal and the other checks still apply.
     OBB measurements are automatic; optional ``obb_rules`` enable additional
     angle, radial centre-offset and edge-separation limits.
     """
@@ -551,24 +585,12 @@ def classify_detections(
         qualifying_ng = list(other_detections)
 
     overlap_note = ""
-    if ok_count == 1 and len(ok_detections) > 1 and ok_overlap_iou > 0:
-        minimum_iou = min(
-            detection_iou(first, second)
-            for first, second in combinations(ok_detections, 2)
+    ok_detections = deduplicate_ok_detections(ok_detections, ok_overlap_iou)
+    if len(ok_detections) < raw_ok_count:
+        overlap_note = (
+            f"; counted {raw_ok_count} overlapping OK boxes as "
+            f"{len(ok_detections)} (IoU threshold={ok_overlap_iou:.3f})"
         )
-        if minimum_iou >= ok_overlap_iou:
-            overlap_note = (
-                f"; counted {len(ok_detections)} overlapping OK boxes as 1 "
-                f"(min IoU={minimum_iou:.3f}, threshold={ok_overlap_iou:.3f})"
-            )
-            ok_detections = [
-                max(ok_detections, key=lambda item: item.confidence)
-            ]
-        else:
-            overlap_note = (
-                f"; min OK IoU={minimum_iou:.3f} "
-                f"below overlap threshold={ok_overlap_iou:.3f}"
-            )
 
     measurements = None
     if obb_rules is not None or any(d.polygon is not None for d in detections):
@@ -996,7 +1018,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     count_group.add_argument(
         "--ok-count",
         type=_positive_int,
-        help="Exact number of OK objects required.",
+        help="Exact number of OK objects required after duplicate removal.",
     )
     count_group.add_argument(
         "--skip-ok-count",
@@ -1004,8 +1026,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="ok_count",
         const=None,
         help=(
-            "Require at least one OK object without an exact count or "
-            "duplicate merging; centre, containment and OBB limits still apply."
+            "Require at least one OK object without an exact count; "
+            "duplicate removal, centre, containment and OBB limits still apply."
         ),
     )
     parser.add_argument(
@@ -1014,8 +1036,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.8,
         metavar="RATIO",
         help=(
-            "When --ok-count is 1, count multiple OK boxes as one only if "
-            "every pair has IoU >= this threshold (0-1); 0 disables it."
+            "Group duplicate OK boxes before counting and geometry checks; "
+            "every pair in a group must have IoU >= this threshold (0-1). "
+            "Keep each group's highest-confidence box; 0 disables grouping."
         ),
     )
     parser.add_argument(

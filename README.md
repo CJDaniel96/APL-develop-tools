@@ -510,7 +510,7 @@ CVAT review 的原始影像與 Pascal VOC XML。
 
 影像必須同時符合以下條件才是 OK：
 
-1. `--ok-label` 的偵測數量等於 `--ok-count`；要求 1 個時可將幾乎重疊的重複框計為 1 個。
+1. `--ok-label` 去除重複框後的物件數量等於 `--ok-count`。
    使用 `--skip-ok-count` 時不限固定數量，但仍至少要有 1 個 OK 框。
 2. 每個計入數量的 OK 框中心都位於影像中央區域；重複框使用信心最高的框。
 3. 其他 label 的 bbox 沒有完整落在任一 OK bbox 內。
@@ -524,16 +524,16 @@ OBB 模型使用旋轉框的實際四個頂點判斷完整包含，邊界接觸�
 位於水平外接矩形內、卻在旋轉框外的 detection 不會因此被判為有效 NG。
 中心位置仍以框的中心計算，OK 數量與中央區域規則相同。
 
-當 `--ok-count 1` 卻偵測到多個 OK 框時，程式會比較**所有 OK 框的兩兩 IoU**
-（交集面積 ÷ 聯集面積）。只有每一對都大於等於 `--ok-overlap-iou`（預設 `0.80`），
-才視為同一個物件並計為 1 個，以信心最高的框檢查中央位置。
-一般框使用矩形 IoU，OBB 使用旋轉框實際多邊形的 IoU。分開的物件、
-只有部分框高度重疊，或 A 與 B、B 與 C 高度重疊但 A 與 C 不符合門檻，仍會判為數量不符。
-`--ok-count` 大於 1 時維持原本的精確數量規則。
-`--skip-ok-count` 不合併重複框，所有 OK 框都會接受中央區域、缺陷包含與已啟用的幾何檢查。
+程式會先依 **IoU**（交集面積 ÷ 聯集面積）去除同一物件的重複 OK 框，再檢查數量、
+中央位置與 OBB 幾何門檻；此步驟與固定數量檢查獨立，`--skip-ok-count` 也會執行。
+依信心分數由高到低分組，同組內每一對框的 IoU 都必須大於等於 `--ok-overlap-iou`
+（預設 `0.80`），每組只保留信心最高的框作為代表，代表框依原偵測順序排列。
+一般框使用矩形 IoU，OBB 使用旋轉框實際多邊形的 IoU。
+分開的物件、只有部分重疊的物件仍分開檢查；若 A 與 B、B 與 C 達到門檻，但 A 與 C
+未達門檻，也不會把三個框全部合併。`--ok-overlap-iou 0` 可關閉所有模式的去重。
 
-這項處理只調整 OK 數量與中心位置的判定；缺陷包含關係仍檢查所有原始 OK 框，
-效果圖與 XML 也保留所有模型 detection。日誌會記錄重複框數量與最小 IoU，方便調整門檻。
+缺陷包含關係仍檢查所有原始 OK 框，效果圖與 XML 也保留所有模型 detection。
+日誌會記錄原始／去重後的 OK 數量與 IoU 門檻，方便確認重複框處理。
 
 輸出結構：
 
@@ -601,8 +601,8 @@ uv run scripts/yolo_classify.py \
 原本的 `--center-tolerance` 中央區域規則仍同時生效；若希望只使用新的中心距離上限，
 可設為 `--center-tolerance 0.5`。這些幾何門檻僅支援 OBB，套用到一般 detection 模型會回報設定錯誤。
 
-要求一個 OK 時，前述重複框處理會先執行，只量測信心最高的代表框，不會把重複框的 `0 px`
-間距當成兩個物件過近。要求多個 OK 時，維持精確數量規則，不自動合併。
+所有數量模式都會先執行前述重複框處理，只量測每組信心最高的代表框，
+不會把同一物件重複框的 `0 px` 間距當成不同物件過近。`--ok-count` 檢查的是去重後的數量。
 原圖、效果圖與 VOC XML 仍保留所有 detection。
 
 若允許不固定數量的 OK 框，只要求至少 1 個、且任兩框至少相隔 10 px，可使用：
@@ -611,11 +611,13 @@ uv run scripts/yolo_classify.py \
 uv run scripts/yolo_classify.py \
     --model ./best-obb.pt --source ./IMAGES --output-dir ./RESULTS_OBB \
     --ok-label component_ok --skip-ok-count \
-    --ok-min-edge-distance 10 --center-tolerance 0.5
+    --ok-overlap-iou 0.8 --ok-min-edge-distance 10 --center-tolerance 0.5
 ```
 
 `--skip-ok-count` 與 `--ok-count` 必須擇一，不能同時使用。此模式下沒有 OK 框仍判 NG；
-只有 1 個 OK 框時沒有配對，略過間距檢查；2 個以上則檢查所有配對，包含重複框。
+去重後只有 1 個 OK 物件時沒有配對，略過間距檢查；2 個以上則檢查所有不同物件的配對。
+例如兩個 IoU 約 99% 的框會保留信心較高的框，JSON 記錄 `raw_ok_count: 2`、
+`effective_ok_count: 1`、`pairs: []`、`min_edge_distance_px: null`，不因重複框判為間距不足。
 `--center-tolerance 0.5` 將允許的框中心區域放寬到整張影像；省略時仍使用中央 50% 區域。
 其他 label 完整落在任一 OK 框內時，仍會判 NG。
 
@@ -658,7 +660,7 @@ uv run scripts/yolo_classify.py -m ./best-obb.pt -s ./IMAGES -o ./RESULTS \
     --ok-label component_ok --ok-count 1 --conf 0.25 --ok-overlap-iou 0.70
 ```
 
-門檻越高，越要求框幾乎一致才計為同一個物件；設為 `0` 可關閉，恢復原始精確數量判定。
+門檻越高，越要求框幾乎一致才計為同一個物件；設為 `0` 可關閉去重，直接使用原始 OK 框。
 此參數只作用於推論後的 OK/NG 判定，與 YOLO 推論階段的 `--iou`（NMS 門檻）分開。
 
 `--center-tolerance 0.25`（預設）代表 OK bbox 的中心點必須位於影像寬與高的中央
@@ -684,9 +686,9 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 | `-s`, `--source` | （必填） | 單一影像或要遞迴搜尋的目錄 |
 | `-o`, `--output-dir` | （必填） | 輸出根目錄；分類下建立 `inference/`、`original/` |
 | `--ok-label` | （必填） | 模型中代表 OK 的完整 label name，區分大小寫 |
-| `--ok-count` | 與 `--skip-ok-count` 擇一 | 必須偵測到的精確 OK 物件數量，至少為 1 |
-| `--skip-ok-count` | 關閉 | 不限固定 OK 數量，但至少要有 1 個；保留其他檢查，不合併重複框 |
-| `--ok-overlap-iou` | `0.80` | 要求 1 個 OK 時，所有 OK 框兩兩 IoU 達此門檻則計為 1 個；`0` 關閉 |
+| `--ok-count` | 與 `--skip-ok-count` 擇一 | 去重後必須偵測到的精確 OK 物件數量，至少為 1 |
+| `--skip-ok-count` | 關閉 | 不限固定 OK 數量，但至少要有 1 個；保留去重與其他檢查 |
+| `--ok-overlap-iou` | `0.80` | 所有數量模式都先依此 IoU 門檻去除重複框，每組保留信心最高者；`0` 關閉 |
 | `--center-tolerance` | `0.25` | bbox 中心相對影像中心的水平、垂直容許比例 |
 | `--ok-angle-target` | `0` | OBB OK 框預期長軸角度，單位 degree，以 180° 為週期 |
 | `--ok-angle-tolerance` | 關閉 | 與目標角度的最大允許偏差，範圍 0–90° |
