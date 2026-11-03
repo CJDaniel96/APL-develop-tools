@@ -5,7 +5,8 @@ An image is OK only when:
 
 * after duplicate removal, the configured OK class occurs exactly
   ``--ok-count`` times, or at least once when ``--skip-ok-count`` is used;
-* each counted OK object's centre is in the configured image-centre region;
+* at least one counted OK object's centre is in the configured image-centre
+  region;
 * no non-OK bounding box is fully contained by an OK bounding box.
 * enabled OBB angle, centre-distance and pairwise-separation limits pass.
 
@@ -556,6 +557,8 @@ def classify_detections(
     duplicate removal in every count mode.
     Set ``ok_count`` to None to require at least one OK object without an
     exact count; duplicate removal and the other checks still apply.
+    At least one representative must meet ``center_tolerance``. Every
+    representative still participates in enabled OBB geometry checks.
     OBB measurements are automatic; optional ``obb_rules`` enable additional
     angle, radial centre-offset and edge-separation limits.
     """
@@ -614,17 +617,14 @@ def classify_detections(
         )
         return _ng_decision(reason, qualifying_ng, detections, measurements)
 
-    off_center = [
-        detection
+    centered_count = sum(
+        bbox_is_in_image_center(detection.bbox, image_size, center_tolerance)
         for detection in ok_detections
-        if not bbox_is_in_image_center(
-            detection.bbox, image_size, center_tolerance
-        )
-    ]
-    if off_center:
+    )
+    if centered_count == 0:
         return _ng_decision(
-            f"{len(off_center)} OK bbox centre(s) outside image centre region"
-            f"{overlap_note}",
+            f"All {len(ok_detections)} OK bbox centre(s) "
+            f"outside image centre region{overlap_note}",
             qualifying_ng,
             detections,
             measurements,
@@ -654,7 +654,8 @@ def classify_detections(
     return Decision(
         is_ok=True,
         reason=(
-            f"detected {len(ok_detections)} centred OK object(s); "
+            f"detected {len(ok_detections)} OK object(s); "
+            f"{centered_count} centre(s) inside image centre region; "
             f"no contained NG bbox{overlap_note}"
         ),
         folder="OK",
@@ -1047,8 +1048,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.25,
         metavar="RATIO",
         help=(
-            "Allowed bbox-centre offset from image centre per axis; 0.25 "
-            "means the middle 50%% of image width and height."
+            "At least one OK object's centre must fall within this offset "
+            "from image centre per axis; 0.25 means the middle 50%% of image "
+            "width and height. Other OK objects still undergo geometry checks."
         ),
     )
     parser.add_argument(

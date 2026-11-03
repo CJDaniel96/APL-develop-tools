@@ -174,6 +174,27 @@ class ObbRuleTest(unittest.TestCase):
         self.assertFalse(decision.is_ok)
         self.assertIn("centre distance 5.00px exceeds 4.90px", decision.reason)
 
+    def test_off_center_neighbor_still_undergoes_geometry_checks(self) -> None:
+        for rules, angle, is_ok, reason in (
+            (ObbRules(min_edge_distance_px=30), 0, True, "1 centre(s) inside"),
+            (ObbRules(min_edge_distance_px=31), 0, False,
+             "edge distance 30.00px below 31.00px"),
+            (ObbRules(max_center_distance_px=30), 0, False,
+             "OK#2 centre distance 45.00px exceeds 30.00px"),
+            (ObbRules(angle_tolerance_deg=5), 20, False, "OK#2 angle 20.00deg"),
+        ):
+            with self.subTest(rules=rules, angle=angle):
+                decision = classify_detections(
+                    [obb((100, 50), 40, 20),
+                     obb((100, 95), 40, 10, angle, confidence=0.26)],
+                    5, None, (200, 100), 0.25, obb_rules=rules,
+                )
+                self.assertEqual(decision.is_ok, is_ok)
+                self.assertIn(reason, decision.reason)
+                assert decision.measurements is not None
+                self.assertEqual(decision.measurements.effective_ok_count, 2)
+                self.assertEqual(len(decision.measurements.pairs), 1)
+
     def test_shortest_gap_limit_is_inclusive(self) -> None:
         items = [obb((80, 50)), obb((103, 50))]
         self.assertTrue(classify(items, min_edge_distance_px=3).is_ok)
@@ -244,7 +265,7 @@ class ObbRuleTest(unittest.TestCase):
                 self.assertAlmostEqual(measured.min_edge_distance_px, min_gap)
                 if is_ok:
                     self.assertIn(
-                        f"detected {len(items)} centred", decision.reason,
+                        f"detected {len(items)} OK object(s)", decision.reason,
                     )
                 else:
                     self.assertIn("edge distance", decision.reason)
@@ -440,7 +461,7 @@ class ObbCliTest(unittest.TestCase):
                         self.assertNotIn("count mismatch", payload["reason"])
                         if gap == 10:
                             self.assertIn(
-                                "detected 2 centred", payload["reason"],
+                                "detected 2 OK object(s)", payload["reason"],
                             )
                         else:
                             self.assertIn(
@@ -488,6 +509,47 @@ class ObbCliTest(unittest.TestCase):
             self.assertEqual(len(detections_from_result(result, result.names)), 2)
             annotation = ET.parse(root / "out/OK/original/part.xml")
             self.assertEqual(len(annotation.getroot().findall("object")), 2)
+
+    def test_cli_accepts_a_centered_object_with_an_off_center_neighbor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "part.png"
+            Image.new("RGB", (369, 258)).save(source)
+            result = Results(
+                np.zeros((258, 369, 3), dtype=np.uint8),
+                path=str(source), names={5: "good"},
+                obb=torch.tensor([
+                    [185.79297, 133.54892, 204.1012, 139.0198,
+                     math.radians(-0.02025), 0.98658, 5],
+                    [187.36422, 249.76955, 205.0600, 14.10145,
+                     math.radians(-0.10671), 0.26608, 5],
+                ]),
+            )
+            arguments = self.arguments(root)
+            count_index = arguments.index("--ok-count")
+            arguments[count_index:count_index + 2] = ["--skip-ok-count"]
+            center_index = arguments.index("--center-tolerance")
+            arguments[center_index + 1] = "0.25"
+            with patch("ultralytics.YOLO") as model_type:
+                model = model_type.return_value
+                model.names, model.task = result.names, "obb"
+                model.predict.return_value = [result]
+                with self.assertLogs("yolo_classify", level="INFO"):
+                    self.assertEqual(main(arguments + [
+                        "--ok-min-edge-distance", "10",
+                    ]), 0)
+            payload = json.loads((
+                root / "out/OK/measurements/part.json"
+            ).read_text())
+            self.assertEqual(payload["verdict"], "OK")
+            self.assertIn("detected 2 OK object(s)", payload["reason"])
+            self.assertIn("1 centre(s) inside image centre region", payload["reason"])
+            measured = payload["measurements"]
+            self.assertEqual(measured["raw_ok_count"], 2)
+            self.assertEqual(measured["effective_ok_count"], 2)
+            self.assertEqual(len(measured["pairs"]), 1)
+            self.assertAlmostEqual(measured["min_edge_distance_px"], 39.51, places=2)
+            self.assertGreater(measured["objects"][1]["center_y_px"], 258 * 0.75)
 
     def test_dry_run_logs_measurements_without_creating_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -512,7 +512,8 @@ CVAT review 的原始影像與 Pascal VOC XML。
 
 1. `--ok-label` 去除重複框後的物件數量等於 `--ok-count`。
    使用 `--skip-ok-count` 時不限固定數量，但仍至少要有 1 個 OK 框。
-2. 每個計入數量的 OK 框中心都位於影像中央區域；重複框使用信心最高的框。
+2. 去重後至少一個 OK 物件的中心位於影像中央區域；重複框使用信心最高的框。
+   其餘鄰近物件可在中央區域之外，但仍接受間距與其他已啟用的幾何檢查。
 3. 其他 label 的 bbox 沒有完整落在任一 OK bbox 內。
 4. 若啟用 OBB 幾何門檻，角度、中心距離與物件最短邊距也都必須合格。
 
@@ -598,7 +599,8 @@ uv run scripts/yolo_classify.py \
 垂直物件可設定 `--ok-angle-target 90`。`--ok-min-edge-distance 0` 允許框接觸或重疊；
 要將這些情況判 NG，請設定正值。
 
-原本的 `--center-tolerance` 中央區域規則仍同時生效；若希望只使用新的中心距離上限，
+`--center-tolerance` 中央區域規則仍同時生效，但只要求至少一個去重後的 OK 物件中心符合。
+`--ok-max-center-distance` 則仍逐一檢查每個 OK 物件；若希望只使用此距離上限，
 可設為 `--center-tolerance 0.5`。這些幾何門檻僅支援 OBB，套用到一般 detection 模型會回報設定錯誤。
 
 所有數量模式都會先執行前述重複框處理，只量測每組信心最高的代表框，
@@ -611,14 +613,16 @@ uv run scripts/yolo_classify.py \
 uv run scripts/yolo_classify.py \
     --model ./best-obb.pt --source ./IMAGES --output-dir ./RESULTS_OBB \
     --ok-label component_ok --skip-ok-count \
-    --ok-overlap-iou 0.8 --ok-min-edge-distance 10 --center-tolerance 0.5
+    --ok-overlap-iou 0.8 --ok-min-edge-distance 10 --center-tolerance 0.25
 ```
 
 `--skip-ok-count` 與 `--ok-count` 必須擇一，不能同時使用。此模式下沒有 OK 框仍判 NG；
 去重後只有 1 個 OK 物件時沒有配對，略過間距檢查；2 個以上則檢查所有不同物件的配對。
 例如兩個 IoU 約 99% 的框會保留信心較高的框，JSON 記錄 `raw_ok_count: 2`、
 `effective_ok_count: 1`、`pairs: []`、`min_edge_distance_px: null`，不因重複框判為間距不足。
-`--center-tolerance 0.5` 將允許的框中心區域放寬到整張影像；省略時仍使用中央 50% 區域。
+`--center-tolerance 0.25` 要求至少一個 OK 物件的中心位於影像中央 50% 區域。
+若主物件符合，鄰近元件即使靠近影像邊緣也不會單因中央位置判 NG；但仍參與所有間距配對。
+全部 OK 物件的中心都在中央區域外時仍判 NG。`0.5` 可將允許區域放寬到整張影像。
 其他 label 完整落在任一 OK 框內時，仍會判 NG。
 
 JSON 的 `measurements.objects` 包含各物件的四角座標、角度、相對目標角度的偏差及中心距離；
@@ -663,8 +667,9 @@ uv run scripts/yolo_classify.py -m ./best-obb.pt -s ./IMAGES -o ./RESULTS \
 門檻越高，越要求框幾乎一致才計為同一個物件；設為 `0` 可關閉去重，直接使用原始 OK 框。
 此參數只作用於推論後的 OK/NG 判定，與 YOLO 推論階段的 `--iou`（NMS 門檻）分開。
 
-`--center-tolerance 0.25`（預設）代表 OK bbox 的中心點必須位於影像寬與高的中央
-50% 區域。若要更嚴格限制在中央 20%，可設為 `0.10`：
+`--center-tolerance 0.25`（預設）代表至少一個去重後的 OK bbox 中心點必須位於影像寬與高的中央
+50% 區域，同一個框的 X、Y 都必須符合。其餘 OK 物件可位於區域外；
+成功的判定理由會列出 OK 物件總數與符合中央區域的數量。若要更嚴格限制在中央 20%，可設為 `0.10`：
 
 ```bash
 uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
@@ -689,7 +694,7 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 | `--ok-count` | 與 `--skip-ok-count` 擇一 | 去重後必須偵測到的精確 OK 物件數量，至少為 1 |
 | `--skip-ok-count` | 關閉 | 不限固定 OK 數量，但至少要有 1 個；保留去重與其他檢查 |
 | `--ok-overlap-iou` | `0.80` | 所有數量模式都先依此 IoU 門檻去除重複框，每組保留信心最高者；`0` 關閉 |
-| `--center-tolerance` | `0.25` | bbox 中心相對影像中心的水平、垂直容許比例 |
+| `--center-tolerance` | `0.25` | 至少一個去重後的 OK bbox 中心須符合此水平、垂直容許比例 |
 | `--ok-angle-target` | `0` | OBB OK 框預期長軸角度，單位 degree，以 180° 為週期 |
 | `--ok-angle-tolerance` | 關閉 | 與目標角度的最大允許偏差，範圍 0–90° |
 | `--ok-max-center-distance` | 關閉 | OBB OK 框中心到影像中心的最大距離，單位 px |
@@ -843,7 +848,7 @@ uv run scripts/e2e_infer.py -i ./IMAGES -o ./RESULTS \
 | `--yolo-model` | （必填） | YOLO `.pt` 模型路徑或名稱 |
 | `--ok-label` / `--ok-count` | （必填） | 與 `yolo_classify.py` 完全相同的規則 |
 | `--ok-overlap-iou` | `0.80` | 與 `yolo_classify.py` 相同的重複 OK 框判定；`0` 關閉 |
-| `--center-tolerance` | `0.25` | OK bbox 中心相對影像中心的容許比例 |
+| `--center-tolerance` | `0.25` | 至少一個去重後的 OK bbox 中心須符合此水平、垂直容許比例 |
 | `--ok-angle-target` / `--ok-angle-tolerance` | `0` / 關閉 | OBB OK 框的目標長軸角度與允許偏差，單位 degree |
 | `--ok-max-center-distance` | 關閉 | OBB OK 框中心距離影像中心的上限，單位 px |
 | `--ok-min-edge-distance` | 關閉 | 兩個 OBB OK 框間距的下限，單位 px |

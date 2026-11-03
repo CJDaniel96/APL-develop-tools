@@ -1457,7 +1457,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     yolo.add_argument(
         "--center-tolerance", type=_unit_interval, default=0.25, metavar="RATIO",
-        help="Allowed OK bbox-centre offset from the image centre per axis.",
+        help="At least one OK object's centre must fall within this offset "
+             "from the image centre per axis; other objects still undergo "
+             "geometry checks.",
     )
     add_obb_arguments(yolo)
     yolo.add_argument("--conf", type=float, default=0.25,

@@ -310,6 +310,49 @@ class ClassificationTest(unittest.TestCase):
         self.assertFalse(result.is_ok)
         self.assertEqual(result.folder, "_ok_rule")
 
+    def test_one_centered_ok_is_sufficient_with_off_center_neighbors(self) -> None:
+        centered = Detection(5, "good", 0.8, (40, 40, 60, 60))
+        neighbor = Detection(5, "good", 0.95, (40, 85, 60, 95))
+        for ok_count in (None, 2):
+            for items in ([centered, neighbor], [neighbor, centered]):
+                with self.subTest(ok_count=ok_count, items=items):
+                    result = self.classify(items, ok_count=ok_count)
+                    self.assertTrue(result.is_ok)
+                    self.assertIn("detected 2 OK object(s)", result.reason)
+                    self.assertIn(
+                        "1 centre(s) inside image centre region", result.reason,
+                    )
+
+    def test_all_off_center_ok_objects_remain_ng(self) -> None:
+        items = [
+            detection(5, "good", (0, 40, 10, 60)),
+            detection(5, "good", (40, 0, 60, 10)),
+        ]
+        for ok_count in (None, 2):
+            with self.subTest(ok_count=ok_count):
+                result = self.classify(items, ok_count=ok_count)
+                self.assertFalse(result.is_ok)
+                self.assertEqual(result.folder, "_ok_rule")
+                self.assertIn("All 2 OK bbox centre(s) outside", result.reason)
+
+    def test_centered_non_ok_detection_does_not_satisfy_center_rule(self) -> None:
+        result = self.classify([
+            detection(5, "good", (0, 0, 10, 10)),
+            detection(1, "crack", (40, 40, 60, 60)),
+        ], ok_count=None)
+        self.assertFalse(result.is_ok)
+        self.assertIn("outside image centre region", result.reason)
+
+    def test_ng_inside_off_center_neighbor_still_counts(self) -> None:
+        result = self.classify([
+            detection(5, "good", (40, 40, 60, 60)),
+            detection(5, "good", (40, 85, 60, 95)),
+            detection(1, "crack", (45, 88, 55, 92)),
+        ], ok_count=None)
+        self.assertFalse(result.is_ok)
+        self.assertEqual(result.folder, "crack")
+        self.assertIn("NG bbox contained", result.reason)
+
     def test_no_detections_uses_diagnostic_folder(self) -> None:
         result = self.classify([])
 
@@ -421,7 +464,7 @@ class ClassificationTest(unittest.TestCase):
         items = [first, first, second, second]
         result = self.classify(items, ok_count=None)
         self.assertTrue(result.is_ok)
-        self.assertIn("detected 2 centred", result.reason)
+        self.assertIn("detected 2 OK object(s)", result.reason)
         self.assertIn("counted 4 overlapping OK boxes as 2", result.reason)
         self.assertEqual(len(items), 4)
 
@@ -432,7 +475,7 @@ class ClassificationTest(unittest.TestCase):
         for items, is_ok, reason in (
             ([], False, "at least one required"),
             ([ng], False, "at least one required"),
-            ([ok], True, "detected 1 centred OK object(s)"),
+            ([ok], True, "detected 1 OK object(s)"),
             ([ok, ng], False, "NG bbox contained"),
             ([off_center], False, "outside image centre region"),
         ):
