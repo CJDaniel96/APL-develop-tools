@@ -511,6 +511,7 @@ CVAT review 的原始影像與 Pascal VOC XML。
 影像必須同時符合以下條件才是 OK：
 
 1. `--ok-label` 的偵測數量等於 `--ok-count`；要求 1 個時可將幾乎重疊的重複框計為 1 個。
+   使用 `--skip-ok-count` 時不限固定數量，但仍至少要有 1 個 OK 框。
 2. 每個計入數量的 OK 框中心都位於影像中央區域；重複框使用信心最高的框。
 3. 其他 label 的 bbox 沒有完整落在任一 OK bbox 內。
 4. 若啟用 OBB 幾何門檻，角度、中心距離與物件最短邊距也都必須合格。
@@ -529,6 +530,7 @@ OBB 模型使用旋轉框的實際四個頂點判斷完整包含，邊界接觸�
 一般框使用矩形 IoU，OBB 使用旋轉框實際多邊形的 IoU。分開的物件、
 只有部分框高度重疊，或 A 與 B、B 與 C 高度重疊但 A 與 C 不符合門檻，仍會判為數量不符。
 `--ok-count` 大於 1 時維持原本的精確數量規則。
+`--skip-ok-count` 不合併重複框，所有 OK 框都會接受中央區域、缺陷包含與已啟用的幾何檢查。
 
 這項處理只調整 OK 數量與中心位置的判定；缺陷包含關係仍檢查所有原始 OK 框，
 效果圖與 XML 也保留所有模型 detection。日誌會記錄重複框數量與最小 IoU，方便調整門檻。
@@ -603,6 +605,20 @@ uv run scripts/yolo_classify.py \
 間距當成兩個物件過近。要求多個 OK 時，維持精確數量規則，不自動合併。
 原圖、效果圖與 VOC XML 仍保留所有 detection。
 
+若允許不固定數量的 OK 框，只要求至少 1 個、且任兩框至少相隔 10 px，可使用：
+
+```bash
+uv run scripts/yolo_classify.py \
+    --model ./best-obb.pt --source ./IMAGES --output-dir ./RESULTS_OBB \
+    --ok-label component_ok --skip-ok-count \
+    --ok-min-edge-distance 10 --center-tolerance 0.5
+```
+
+`--skip-ok-count` 與 `--ok-count` 必須擇一，不能同時使用。此模式下沒有 OK 框仍判 NG；
+只有 1 個 OK 框時沒有配對，略過間距檢查；2 個以上則檢查所有配對，包含重複框。
+`--center-tolerance 0.5` 將允許的框中心區域放寬到整張影像；省略時仍使用中央 50% 區域。
+其他 label 完整落在任一 OK 框內時，仍會判 NG。
+
 JSON 的 `measurements.objects` 包含各物件的四角座標、角度、相對目標角度的偏差及中心距離；
 `measurements.pairs` 包含每一對物件的最短邊距，`min_edge_distance_px` 是全圖最小值。
 物件編號由 1 開始，依重複框處理後的 OK detection 順序排列。
@@ -668,7 +684,8 @@ uv run scripts/yolo_classify.py -m ./best.pt -s ./IMAGES -o ./RESULTS \
 | `-s`, `--source` | （必填） | 單一影像或要遞迴搜尋的目錄 |
 | `-o`, `--output-dir` | （必填） | 輸出根目錄；分類下建立 `inference/`、`original/` |
 | `--ok-label` | （必填） | 模型中代表 OK 的完整 label name，區分大小寫 |
-| `--ok-count` | （必填） | 必須偵測到的精確 OK 物件數量，至少為 1 |
+| `--ok-count` | 與 `--skip-ok-count` 擇一 | 必須偵測到的精確 OK 物件數量，至少為 1 |
+| `--skip-ok-count` | 關閉 | 不限固定 OK 數量，但至少要有 1 個；保留其他檢查，不合併重複框 |
 | `--ok-overlap-iou` | `0.80` | 要求 1 個 OK 時，所有 OK 框兩兩 IoU 達此門檻則計為 1 個；`0` 關閉 |
 | `--center-tolerance` | `0.25` | bbox 中心相對影像中心的水平、垂直容許比例 |
 | `--ok-angle-target` | `0` | OBB OK 框預期長軸角度，單位 degree，以 180° 為週期 |

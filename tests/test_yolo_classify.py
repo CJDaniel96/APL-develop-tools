@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import math
 import tempfile
 import unittest
@@ -224,7 +225,7 @@ class ClassificationTest(unittest.TestCase):
     def classify(
         self,
         items: list[Detection],
-        ok_count: int = 1,
+        ok_count: int | None = 1,
         ok_overlap_iou: float = 0.8,
     ):
         return classify_detections(
@@ -402,6 +403,26 @@ class ClassificationTest(unittest.TestCase):
         self.assertTrue(self.classify(items, ok_count=2).is_ok)
         self.assertFalse(self.classify(items * 2, ok_count=2).is_ok)
 
+    def test_skip_count_requires_ok_and_preserves_other_rules(self) -> None:
+        ok = detection(5, "good", self.ok_box)
+        ng = detection(1, "crack", (30, 30, 40, 40))
+        off_center = detection(5, "good", (0, 0, 10, 10))
+        for items, is_ok, reason in (
+            ([], False, "at least one required"),
+            ([ng], False, "at least one required"),
+            ([ok], True, "detected 1 centred OK object(s)"),
+            ([ok, ng], False, "NG bbox contained"),
+            ([off_center], False, "outside image centre region"),
+        ):
+            with self.subTest(items=items):
+                result = self.classify(items, ok_count=None)
+                self.assertEqual(result.is_ok, is_ok)
+                self.assertIn(reason, result.reason)
+                if items == [ng] or items == [ok, ng]:
+                    self.assertEqual(result.folder, "crack")
+                elif not items:
+                    self.assertEqual(result.folder, "_no_detection")
+
 
 class ClassificationCliTest(unittest.TestCase):
     def arguments(self, root: Path) -> list[str]:
@@ -414,6 +435,17 @@ class ClassificationCliTest(unittest.TestCase):
     def test_default_overlap_threshold(self) -> None:
         args = parse_args(self.arguments(Path("/tmp")))
         self.assertEqual(args.ok_overlap_iou, 0.8)
+
+    def test_count_mode_requires_exactly_one_option(self) -> None:
+        args = self.arguments(Path("/tmp"))
+        self.assertEqual(parse_args(args).ok_count, 1)
+        self.assertIsNone(parse_args(args[:-2] + ["--skip-ok-count"]).ok_count)
+        for invalid in (args[:-2], args + ["--skip-ok-count"]):
+            with self.subTest(arguments=invalid):
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as raised:
+                        parse_args(invalid)
+                self.assertEqual(raised.exception.code, 2)
 
     def test_cli_applies_threshold_and_keeps_all_review_boxes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

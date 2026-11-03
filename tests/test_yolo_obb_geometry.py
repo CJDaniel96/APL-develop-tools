@@ -216,6 +216,47 @@ class ObbRuleTest(unittest.TestCase):
         assert decision.measurements is not None
         self.assertEqual(decision.measurements.effective_ok_count, 2)
 
+    def test_skip_count_checks_all_pairs_without_duplicate_merging(self) -> None:
+        for centers, is_ok, min_gap in (
+            ((80, 120), True, 20),
+            ((80, 105), False, 5),
+            ((80, 100), False, 0),
+            ((80, 80.1), False, 0),
+            ((50, 90, 130), True, 20),
+            ((50, 100, 125), False, 5),
+        ):
+            with self.subTest(centers=centers):
+                items = [obb((x, 50)) for x in centers]
+                decision = classify_detections(
+                    items, 5, None, (200, 100), 0.5,
+                    obb_rules=ObbRules(min_edge_distance_px=10),
+                )
+                self.assertEqual(decision.is_ok, is_ok)
+                self.assertNotIn("count mismatch", decision.reason)
+                measured = decision.measurements
+                assert measured is not None
+                self.assertEqual(measured.effective_ok_count, len(items))
+                self.assertEqual(
+                    len(measured.pairs), len(items) * (len(items) - 1) // 2,
+                )
+                self.assertAlmostEqual(measured.min_edge_distance_px, min_gap)
+                if is_ok:
+                    self.assertIn(
+                        f"detected {len(items)} centred", decision.reason,
+                    )
+                else:
+                    self.assertIn("edge distance", decision.reason)
+
+    def test_skip_count_with_single_obb_has_no_gap_to_check(self) -> None:
+        decision = classify_detections(
+            [obb((100, 50))], 5, None, (200, 100), 0.5,
+            obb_rules=ObbRules(min_edge_distance_px=10),
+        )
+        self.assertTrue(decision.is_ok)
+        assert decision.measurements is not None
+        self.assertEqual(decision.measurements.pairs, ())
+        self.assertIsNone(decision.measurements.min_edge_distance_px)
+
     def test_every_enabled_geometry_failure_is_reported(self) -> None:
         decision = classify(
             [obb((110, 50), angle=30)],
@@ -302,6 +343,43 @@ class ObbCliTest(unittest.TestCase):
             self.assertEqual(payload["measurements"]["objects"], [])
             self.assertEqual(payload["measurements"]["pairs"], [])
             self.assertIsNone(payload["measurements"]["min_edge_distance_px"])
+
+    def test_cli_skip_count_saves_gap_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "part.png"
+            Image.new("RGB", (200, 200)).save(source)
+            result = self.result(source)
+            arguments = self.arguments(root)
+            count_index = arguments.index("--ok-count")
+            arguments[count_index:count_index + 2] = ["--skip-ok-count"]
+            with patch("ultralytics.YOLO") as model_type:
+                model = model_type.return_value
+                model.names, model.task = result.names, "obb"
+                model.predict.return_value = [result]
+                for gap, category in ((10, "OK"), (12, "NG/_ok_rule")):
+                    with self.subTest(gap=gap):
+                        with self.assertLogs("yolo_classify", level="INFO"):
+                            self.assertEqual(main(arguments + [
+                                "--ok-min-edge-distance", str(gap),
+                            ]), 0)
+                        payload = json.loads((
+                            root / "out" / category / "measurements/part.json"
+                        ).read_text())
+                        self.assertEqual(payload["verdict"], category[:2])
+                        self.assertEqual(
+                            payload["measurements"]["effective_ok_count"], 2,
+                        )
+                        self.assertNotIn("count mismatch", payload["reason"])
+                        if gap == 10:
+                            self.assertIn(
+                                "detected 2 centred", payload["reason"],
+                            )
+                        else:
+                            self.assertIn(
+                                "distance 10.00px below 12.00px",
+                                payload["reason"],
+                            )
 
     def test_dry_run_logs_measurements_without_creating_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

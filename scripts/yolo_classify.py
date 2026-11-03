@@ -4,7 +4,8 @@
 An image is OK only when:
 
 * the configured OK class occurs exactly ``--ok-count`` times (near-identical
-  boxes can count as one when only one OK object is required);
+  boxes can count as one when only one OK object is required), or at least
+  once when ``--skip-ok-count`` is used;
 * each counted OK object's centre is in the configured image-centre region;
 * no non-OK bounding box is fully contained by an OK bounding box.
 * enabled OBB angle, centre-distance and pairwise-separation limits pass.
@@ -506,7 +507,7 @@ def safe_folder_name(label: str) -> str:
 def classify_detections(
     detections: Sequence[Detection],
     ok_class_id: int,
-    ok_count: int,
+    ok_count: int | None,
     image_size: tuple[int, int],
     center_tolerance: float,
     ok_overlap_iou: float = 0.8,
@@ -519,6 +520,8 @@ def classify_detections(
     from the highest-confidence box.  NG containment always uses every
     original OK box, and the input detections are left intact for review.
     Set ``ok_overlap_iou`` to zero to require the original exact count.
+    Set ``ok_count`` to None to require at least one OK object without an
+    exact count or duplicate merging; all OK boxes retain the other checks.
     OBB measurements are automatic; optional ``obb_rules`` enable additional
     angle, radial centre-offset and edge-separation limits.
     """
@@ -574,7 +577,15 @@ def classify_detections(
         )
         overlap_note += _measurement_summary(measurements)
 
-    if len(ok_detections) != ok_count:
+    if ok_count is None and not ok_detections:
+        return _ng_decision(
+            f"No OK objects detected (at least one required){overlap_note}",
+            qualifying_ng,
+            detections,
+            measurements,
+        )
+
+    if ok_count is not None and len(ok_detections) != ok_count:
         reason = (
             f"OK count mismatch: expected {ok_count}, "
             f"detected {len(ok_detections)}{overlap_note}"
@@ -621,7 +632,7 @@ def classify_detections(
     return Decision(
         is_ok=True,
         reason=(
-            f"detected {ok_count} centred OK object(s); "
+            f"detected {len(ok_detections)} centred OK object(s); "
             f"no contained NG bbox{overlap_note}"
         ),
         folder="OK",
@@ -981,11 +992,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Exact YOLO class name that represents OK.",
     )
-    parser.add_argument(
+    count_group = parser.add_mutually_exclusive_group(required=True)
+    count_group.add_argument(
         "--ok-count",
-        required=True,
         type=_positive_int,
         help="Exact number of OK objects required.",
+    )
+    count_group.add_argument(
+        "--skip-ok-count",
+        action="store_const",
+        dest="ok_count",
+        const=None,
+        help=(
+            "Require at least one OK object without an exact count or "
+            "duplicate merging; centre, containment and OBB limits still apply."
+        ),
     )
     parser.add_argument(
         "--ok-overlap-iou",
@@ -1127,11 +1148,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _LOGGER.info(
-        "Found %d image(s); OK class is %s (id=%d), expected count=%d",
+        "Found %d image(s); OK class is %s (id=%d), expected count=%s",
         len(images),
         args.ok_label,
         ok_class_id,
-        args.ok_count,
+        (args.ok_count if args.ok_count is not None
+         else "at least 1 (exact count disabled)"),
     )
 
     stats = Stats()
